@@ -1,7 +1,10 @@
 //! Per-session adapter state that has to survive a restart: where archiving and extraction stand in the
 //! engine's history, and whether the session's opening bridge was already shown. Plain JSON files under
 //! `<state_dir>/helicon-memory/sessions/`, written atomically.
-use super::util::{iso_now, now_ms};
+use super::{
+    log::Logger,
+    util::{iso_now, now_ms},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 
@@ -52,13 +55,18 @@ fn safe_id(id: &str) -> bool {
 pub(crate) struct SessionStore {
     dir: PathBuf,
     cache: HashMap<String, SessionRecord>,
+    logger: Logger,
+    /// The last save failed (said once per run of failures, not on every save).
+    failing: bool,
 }
 
 impl SessionStore {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf, logger: Logger) -> Self {
         Self {
             dir: root.join("sessions"),
             cache: HashMap::new(),
+            logger,
+            failing: false,
         }
     }
 
@@ -94,14 +102,25 @@ impl SessionStore {
         let Some(file) = self.file(session_id) else {
             return;
         };
-        // the cursors are an optimisation: without them the next run resends and the server de-duplicates
-        let _ = (|| -> std::io::Result<()> {
+        // The cursors are an optimisation: without them the next run resends and the server de-duplicates.
+        // A failure is still said, once, so a full disk or a bad permission does not go unnoticed.
+        let saved = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&self.dir)?;
             let tmp = file.with_extension(format!("{}.tmp", std::process::id()));
             let text = serde_json::to_string(rec).map_err(std::io::Error::other)?;
             write_private(&tmp, text.as_bytes())?;
             std::fs::rename(&tmp, &file)
         })();
+        match saved {
+            Ok(()) => self.failing = false,
+            Err(err) if !self.failing => {
+                self.failing = true;
+                self.logger.warn(&format!(
+                    "[helicon-memory] could not save the progress of session {session_id}: {err} (it will be sent again after a restart)"
+                ));
+            }
+            Err(_) => {}
+        }
     }
 
     /// Ids of the saved sessions (those of earlier runs too).
@@ -143,7 +162,10 @@ mod tests {
     #[test]
     fn a_record_survives_a_restart_and_a_damaged_file_starts_over() {
         let dir = tempfile::tempdir().unwrap();
-        let mut a = SessionStore::new(dir.path().to_path_buf());
+        let mut a = SessionStore::new(
+            dir.path().to_path_buf(),
+            Logger::new(dir.path().join("log"), false),
+        );
         assert!(!a.has("s1"));
         {
             let rec = a.get("s1");
@@ -152,20 +174,29 @@ mod tests {
         }
         a.save("s1");
         assert!(a.has("s1"));
-        let mut b = SessionStore::new(dir.path().to_path_buf());
+        let mut b = SessionStore::new(
+            dir.path().to_path_buf(),
+            Logger::new(dir.path().join("log"), false),
+        );
         assert!(b.has("s1"));
         assert_eq!(b.get("s1").archive_next, 7);
         assert!(b.get("s1").bridge_pending);
         assert_eq!(b.list(), vec!["s1".to_owned()]);
         std::fs::write(dir.path().join("sessions").join("s2.json"), "{broken").unwrap();
-        let mut c = SessionStore::new(dir.path().to_path_buf());
+        let mut c = SessionStore::new(
+            dir.path().to_path_buf(),
+            Logger::new(dir.path().join("log"), false),
+        );
         assert_eq!(c.get("s2").archive_next, 0);
     }
 
     #[test]
     fn an_unsafe_id_is_never_a_path() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = SessionStore::new(dir.path().to_path_buf());
+        let mut s = SessionStore::new(
+            dir.path().to_path_buf(),
+            Logger::new(dir.path().join("log"), false),
+        );
         s.get("../x").archive_next = 1;
         s.save("../x");
         assert!(!dir.path().join("x.json").exists());

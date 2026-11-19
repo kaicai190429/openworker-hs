@@ -562,6 +562,35 @@ impl HeliconClient {
                 "helicon-memory POST {path}: answer is not JSON: {e}"
             ))
         })?;
+        // `{retcode, retmsg}` with HTTP 200 is how HeliconSearch refuses a write it did not accept (a tenant
+        // check): not an empty result, or the slice would be taken for extracted and never sent again
+        if raw.get("code").is_none() {
+            if let Some(retcode) = raw
+                .get("retcode")
+                .and_then(Value::as_i64)
+                .filter(|c| *c != 0)
+            {
+                let retmsg = raw.get("retmsg").and_then(Value::as_str).map(str::to_owned);
+                self.log_failure(
+                    &Method::POST,
+                    path,
+                    status.as_u16(),
+                    &format!(
+                        "retcode={retcode} retmsg={}",
+                        retmsg.as_deref().unwrap_or("?")
+                    ),
+                );
+                return Err(HsError::Api {
+                    status: status.as_u16(),
+                    retcode: Some(retcode),
+                    retmsg: retmsg.clone(),
+                    message: format!(
+                        "helicon-memory POST {path} failed: retcode={retcode} {}",
+                        retmsg.unwrap_or_default()
+                    ),
+                });
+            }
+        }
         let code = raw.get("code").and_then(Value::as_i64).unwrap_or(200);
         let numbers = |key: &str| -> Vec<i64> {
             raw.get(key)
@@ -901,5 +930,114 @@ mod tests {
         };
         assert_eq!(t.kind(), "deadline");
         assert_eq!(t.describe(), "slow");
+    }
+
+    use crate::helicon::test_support::{MockHs, Reply};
+    use std::sync::{Arc, Mutex};
+
+    fn client_for(hs: &MockHs) -> HeliconClient {
+        let logger = Logger::new(
+            std::env::temp_dir().join("helicon-client-retry-test.log"),
+            false,
+        );
+        HeliconClient::new(&hs.url(), "hs_test", 5_000, logger, false)
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_is_retried_and_a_refusal_is_not() {
+        let calls = Arc::new(Mutex::new(0));
+        let counter = calls.clone();
+        let hs = MockHs::start(move |req| {
+            let n = {
+                let mut c = counter.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            match (req.path.as_str(), n) {
+                ("/v1/memory/health", 1 | 2) => {
+                    Reply::status(503, json!({"code": 503, "message": "busy"}))
+                }
+                ("/v1/memory/health", _) => {
+                    Reply::ok(json!({"code": 200, "data": {"overall": true}}))
+                }
+                ("/v1/memory/session/start", _) => {
+                    Reply::status(400, json!({"retcode": 9, "retmsg": "bad session"}))
+                }
+                (other, _) => panic!("unexpected {other}"),
+            }
+        })
+        .await;
+        let client = client_for(&hs);
+        // 503, 503, then the answer: three requests, and the {code, data} envelope is unwrapped
+        let health = client.health().await.unwrap();
+        assert_eq!(health["overall"], true);
+        assert_eq!(hs.requests().len(), 3);
+        // a 400 is the server's no: one request, and the error says what the server said
+        let err = client
+            .session_start(json!({"session_id": "s"}))
+            .await
+            .unwrap_err();
+        assert_eq!(hs.requests().len(), 4);
+        assert_eq!(err.kind(), "http");
+        assert_eq!(
+            err.describe(),
+            "HeliconApiError status=400 retcode=9 retmsg=bad session"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recall_query_is_sent_once_even_when_the_server_is_busy() {
+        let hs =
+            MockHs::start(|_| Reply::status(503, json!({"code": 503, "message": "busy"}))).await;
+        let err = client_for(&hs)
+            .query(json!({"query": "q"}), &CallOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "unavailable");
+        assert_eq!(
+            hs.requests().len(),
+            1,
+            "a second copy of an expensive request only adds to the congestion"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operator_answers_are_read_in_all_their_shapes() {
+        let hs = MockHs::start(|req| {
+            let body = &req.body;
+            match body["session_id"].as_str().unwrap_or("") {
+                "queued" => Reply::ok(json!({"code": 202, "queued": true, "work_unit_id": "w1"})),
+                "in-flight" => Reply::ok(json!({"code": 202})),
+                "refused" => Reply::ok(json!({"retcode": 3, "retmsg": "tenant refused"})),
+                "failed" => Reply::ok(json!({"code": 500, "message": "model down"})),
+                _ => Reply::ok(json!({
+                    "code": 200, "data": [{"action": "ADD", "memory_id": "m1"}], "already_processed": false,
+                    "audit": {"processing": {"state": "extracted"}}, "work_unit_id": "w2"
+                })),
+            }
+        })
+        .await;
+        let client = client_for(&hs);
+        let add = |session: &str| client.add(json!({"session_id": session, "messages": []}));
+        let queued = add("queued").await.unwrap();
+        assert!(queued.queued && queued.work_unit_id.as_deref() == Some("w1"));
+        // a 202 that hands over no work unit is not an acceptance: it must be sent again
+        assert_eq!(add("in-flight").await.unwrap_err().kind(), "http");
+        assert!(add("refused")
+            .await
+            .unwrap_err()
+            .describe()
+            .contains("retcode=3"));
+        assert!(add("failed")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("model down"));
+        let done = add("ok").await.unwrap();
+        assert!(
+            !done.queued
+                && done.operations.len() == 1
+                && done.processing_state.as_deref() == Some("extracted")
+        );
     }
 }

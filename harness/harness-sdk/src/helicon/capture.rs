@@ -439,32 +439,7 @@ async fn extract(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helicon::{
-        history::HistoryPage,
-        test_support::{MockHs, Reply},
-    };
-    use futures_util::future::BoxFuture;
-
-    /// A history the test controls.
-    struct FakeHistory {
-        items: Mutex<Vec<(usize, Value)>>,
-    }
-
-    impl HistorySource for FakeHistory {
-        fn read<'a>(
-            &'a self,
-            _session_id: &'a str,
-            after: usize,
-        ) -> BoxFuture<'a, Result<HistoryPage, String>> {
-            Box::pin(async move {
-                let items = self.items.lock().unwrap();
-                Ok(HistoryPage {
-                    items: items.iter().filter(|(i, _)| *i >= after).cloned().collect(),
-                    next: items.len().max(after),
-                })
-            })
-        }
-    }
+    use crate::helicon::test_support::{FakeHistory, MockHs, Reply};
 
     fn setup(
         hs: &MockHs,
@@ -485,7 +460,10 @@ mod tests {
             .unwrap(),
         );
         let logger = Logger::new(dir.path().join("log"), false);
-        let store = Arc::new(Mutex::new(SessionStore::new(dir.path().to_path_buf())));
+        let store = Arc::new(Mutex::new(SessionStore::new(
+            dir.path().to_path_buf(),
+            logger.clone(),
+        )));
         let history = Arc::new(FakeHistory {
             items: Mutex::new(history),
         });
@@ -724,10 +702,11 @@ mod tests {
         let engine = CaptureEngine::new(CaptureDeps {
             cfg: cfg.clone(),
             client: HeliconClient::new(&cfg.base_url, &cfg.api_key, 2_000, logger.clone(), false),
-            store: Arc::new(Mutex::new(SessionStore::new(dir.path().to_path_buf()))),
-            history: Arc::new(FakeHistory {
-                items: Mutex::new(vec![(0, user("I prefer dark mode"))]),
-            }),
+            store: Arc::new(Mutex::new(SessionStore::new(
+                dir.path().to_path_buf(),
+                logger.clone(),
+            ))),
+            history: Arc::new(FakeHistory::new(vec![(0, user("I prefer dark mode"))])),
             logger,
             own_tool_prefix: "helicon__",
         });
@@ -754,5 +733,137 @@ mod tests {
         assert_eq!(engine.sessions(), vec!["s1".to_owned()]);
         engine.release("s1");
         assert!(engine.sessions().is_empty());
+    }
+
+    use sha2::{Digest, Sha256};
+
+    fn log_of(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join("log")).unwrap_or_default()
+    }
+
+    fn receipt(index: u64, status: &str) -> Value {
+        json!({"turn_index": index, "sql_status": status, "turn_id": format!("t{index}"),
+            "content_hash": "stored-hash", "incoming_hash": "incoming-hash"})
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_archive_holds_differently_is_kept_aside_not_retried_and_sent_to_extraction_without_a_ref(
+    ) {
+        let hs = MockHs::start(|req| match req.path.as_str() {
+            "/v1/memory/session/start" => Reply::ok(json!({})),
+            "/v1/memory/session/turn" => {
+                // turn 0 is archived as sent (its receipt carries the real hash of its text); turn 1 conflicts
+                let hash: String = Sha256::digest(b"I prefer dark mode")
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let mut stored = receipt(0, "stored");
+                stored["content_hash"] = json!(hash);
+                Reply::ok(json!({"results": [stored, receipt(1, "revision_conflict")]}))
+            }
+            "/v1/memory/add" => {
+                Reply::ok(json!({"code": 202, "queued": true, "work_unit_id": "w"}))
+            }
+            other => panic!("unexpected {other}"),
+        })
+        .await;
+        let (engine, store, dir, _h) = setup(
+            &hs,
+            "operator",
+            vec![(0, user("I prefer dark mode")), (1, assistant("Noted."))],
+        );
+        assert!(engine.flush("s1", 5_000).await);
+        // the conflict is not an error to resend: the archive keeps what it has, and the cursors move on
+        {
+            let mut store = store.lock().unwrap();
+            let rec = store.get("s1");
+            assert_eq!((rec.archive_next, rec.extract_next), (2, 2));
+        }
+        assert!(
+            log_of(&dir).contains("turn 1 conflicts with the archive"),
+            "{}",
+            log_of(&dir)
+        );
+        // the extraction got both messages; the one the archive agrees with is tied to it by its receipt
+        let add = hs
+            .requests()
+            .into_iter()
+            .find(|r| r.path == "/v1/memory/add")
+            .unwrap()
+            .body;
+        let messages = add["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["archive_ref"]["turn_id"], "t0", "{messages:?}");
+        assert!(
+            messages[1].get("archive_ref").is_none(),
+            "the conflicting turn is not the archived one: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extraction_the_server_could_not_do_yet_is_sent_again() {
+        for first in [
+            Reply::ok(json!({"code": 200, "data": [], "not_archived": [0]})),
+            Reply::status(500, json!({"code": 500, "message": "extraction down"})),
+            // a refusal HeliconSearch answers with HTTP 200 (a tenant check): not an empty success
+            Reply::ok(json!({"retcode": 7, "retmsg": "tenant refused"})),
+        ] {
+            let first = Mutex::new(Some(first));
+            let adds = Arc::new(Mutex::new(0));
+            let counter = adds.clone();
+            let hs = MockHs::start(move |req| match req.path.as_str() {
+                "/v1/memory/session/start" => Reply::ok(json!({})),
+                "/v1/memory/session/turn" => Reply::ok(json!({"results": [receipt(0, "stored")]})),
+                "/v1/memory/add" => {
+                    *counter.lock().unwrap() += 1;
+                    first.lock().unwrap().take().unwrap_or_else(|| {
+                        Reply::ok(json!({"code": 200, "data": [{"action": "ADD", "memory_id": "m1", "status": "created"}]}))
+                    })
+                }
+                other => panic!("unexpected {other}"),
+            })
+            .await;
+            let (engine, store, _dir, _h) =
+                setup(&hs, "operator", vec![(0, user("I prefer dark mode"))]);
+            engine.flush("s1", 5_000).await;
+            assert_eq!(
+                store.lock().unwrap().get("s1").extract_next,
+                0,
+                "not extracted: the cursor stays"
+            );
+            // the next cycle finds extraction behind archive and sends the same slice again
+            engine.flush("s1", 5_000).await;
+            assert_eq!(*adds.lock().unwrap(), 2);
+            assert_eq!(store.lock().unwrap().get("s1").extract_next, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_that_do_not_match_the_archive_are_said_but_are_not_an_error_to_retry() {
+        let hs = MockHs::start(|req| match req.path.as_str() {
+            "/v1/memory/session/start" => Reply::ok(json!({})),
+            "/v1/memory/session/turn" => Reply::ok(json!({"results": [receipt(0, "stored")]})),
+            "/v1/memory/add" => {
+                Reply::ok(json!({"code": 200, "data": [], "archive_mismatched": [0]}))
+            }
+            other => panic!("unexpected {other}"),
+        })
+        .await;
+        let (engine, store, dir, _h) =
+            setup(&hs, "operator", vec![(0, user("I prefer dark mode"))]);
+        engine.flush("s1", 5_000).await;
+        assert_eq!(store.lock().unwrap().get("s1").extract_next, 1);
+        assert!(
+            log_of(&dir).contains("do not match the archive"),
+            "{}",
+            log_of(&dir)
+        );
+        assert_eq!(
+            hs.requests()
+                .iter()
+                .filter(|r| r.path == "/v1/memory/add")
+                .count(),
+            1
+        );
     }
 }

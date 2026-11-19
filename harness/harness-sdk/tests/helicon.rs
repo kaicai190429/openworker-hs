@@ -4,81 +4,17 @@
 //!
 //! The extension is switched on by `helicon-memory.json` in the state directory, exactly as an
 //! application would.
+#[path = "support/helicon_fixture.rs"]
+mod helicon_fixture;
 #[path = "support/hs_mock.rs"]
 mod hs_mock;
 #[path = "support/tool.rs"]
 mod tool;
-use hs_mock::{MockHs, Reply, Request};
-use openworker_sdk::agents::*;
+use helicon_fixture::*;
+use hs_mock::MockHs;
+use openworker_sdk::{agents::*, ConnectionState, Error};
 use serde_json::{json, Value};
-use std::{path::PathBuf, time::Duration};
-
-const MEMORY_ID: &str = "0123456789abcdef0123456789abcdef";
-
-fn runner() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_sdk-test-host"))
-}
-
-fn workspace(root: &std::path::Path) -> PathBuf {
-    let w = root.join("work");
-    std::fs::create_dir_all(&w).unwrap();
-    w
-}
-
-/// A HeliconSearch that remembers a fact, archives what it is sent and ends sessions.
-async fn hs() -> MockHs {
-    MockHs::start(|req| match req.path.split('?').next().unwrap() {
-        "/v1/memory/health" => Reply::ok(json!({"overall": true})),
-        "/v1/memory/query" => {
-            let text = "- likes tea\n";
-            Reply::ok(json!({
-                "grounded_facts": [{"id": "pkg:1", "claim": "likes tea", "score": 0.9,
-                    "support_level": "grounded", "source_memory_ids": [MEMORY_ID]}],
-                "prompt_text": text,
-                "prompt_blocks": {"protocol": "blocks.v1", "blocks": [
-                    {"text": text, "ref": {"type": "memory", "memory_id": MEMORY_ID, "version": "v1", "extras": []}}
-                ]},
-            }))
-        }
-        "/v1/memory/session_bridge" => Reply::ok(json!({
-            "protocol": "bridge.v2", "is_empty": false, "conflict_limit": 3, "conflicts": [],
-            "recent_episodes": [], "category_summaries": [], "procedures": [],
-            "pinned_semantics": [{"id": "pin1", "text": "lives in Oslo", "category": "fact",
-                "version": "v1", "conflict_ids": []}],
-        })),
-        "/v1/memory/session/start" => Reply::ok(json!({"status": "started"})),
-        "/v1/memory/session/turn" => {
-            let results: Vec<Value> = req.body["turns"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| {
-                    json!({"turn_index": t["turn_index"], "sql_status": "stored",
-                        "turn_id": format!("t{}", t["turn_index"]), "content_hash": "h"})
-                })
-                .collect();
-            Reply::ok(json!({"archived": results.len(), "results": results}))
-        }
-        "/v1/memory/add" => Reply::ok(json!({"code": 202, "queued": true, "work_unit_id": "w1"})),
-        "/v1/memory/session/end" => Reply::ok(json!({"status": "closed", "memory_id": "summary1"})),
-        other => panic!("unexpected request to the fake HeliconSearch: {other}"),
-    })
-    .await
-}
-
-/// Writes the extension's configuration into the state directory.
-fn configure(root: &std::path::Path, hs: &MockHs, extra: Value) {
-    let mut cfg = json!({
-        "baseUrl": hs.url(), "apiKey": "hs_test", "agentId": "tester", "projectId": "proj",
-        "captureMode": "operator", "closeWaitMs": 5000,
-    });
-    for (k, v) in extra.as_object().unwrap() {
-        cfg[k] = v.clone();
-    }
-    let state = root.join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    std::fs::write(state.join("helicon-memory.json"), cfg.to_string()).unwrap();
-}
+use std::time::Duration;
 
 async fn start(root: &std::path::Path) -> Harness {
     Harness::builder()
@@ -101,40 +37,6 @@ fn agent() -> Agent {
         .instructions("Be helpful.")
         .memory(true)
         .approvals(Approvals::Never)
-}
-
-async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(60), f)
-        .await
-        .unwrap()
-}
-
-/// Waits until the fake HeliconSearch has seen a request on `path`.
-async fn seen(hs: &MockHs, path: &str) -> Request {
-    for _ in 0..200 {
-        if let Some(r) = hs
-            .requests()
-            .into_iter()
-            .find(|r| r.path.split('?').next() == Some(path))
-        {
-            return r;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "no request to {path}; saw {:?}",
-        hs.requests()
-            .iter()
-            .map(|r| r.path.clone())
-            .collect::<Vec<_>>()
-    );
-}
-
-fn all(hs: &MockHs, path: &str) -> Vec<Request> {
-    hs.requests()
-        .into_iter()
-        .filter(|r| r.path.split('?').next() == Some(path))
-        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -378,4 +280,367 @@ async fn it_works_the_same_with_the_engine_in_a_child_process() {
     within(s.close()).await.unwrap();
     seen(&hs, "/v1/memory/session/end").await;
     within(h.shutdown()).await.unwrap();
+}
+
+fn ends(hs: &MockHs) -> usize {
+    all(hs, "/v1/memory/session/end").len()
+}
+
+async fn until<F: Fn() -> bool>(what: &str, seconds: u64, done: F) {
+    for _ in 0..seconds * 20 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("gave up waiting for {what}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_session_is_ended_without_close_and_ended_again_after_it_is_used_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(
+        &root,
+        &hs,
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 2000}),
+    );
+    let h = start(&root).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    within(s.run(SAY)).await.unwrap();
+    // nobody closes it: the idle sweep does, once
+    until("the idle end", 15, || ends(&hs) == 1).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        ends(&hs),
+        1,
+        "an ended session is not ended again while it stays quiet"
+    );
+    // used again: archived into the same HeliconSearch session, ended again when quiet again
+    within(s.run(SAY)).await.unwrap();
+    until("the second end", 15, || ends(&hs) == 2).await;
+    let sessions: std::collections::BTreeSet<String> = all(&hs, "/v1/memory/session/end")
+        .iter()
+        .map(|r| r.body["session_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(sessions.len(), 1, "both ends are of the one session");
+    let last_end = &all(&hs, "/v1/memory/session/end")[1];
+    assert!(
+        last_end.body["message_count"].as_i64().unwrap() >= 4,
+        "{}",
+        last_end.body
+    );
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_an_earlier_run_left_open_is_ended_at_the_next_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    // the first run: endOnShutdown off, so shutting down leaves the session open (as a killed run would)
+    configure(
+        &root,
+        &hs,
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 600000, "endOnShutdown": false}),
+    );
+    let h = start(&root).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    within(s.run(SAY)).await.unwrap();
+    seen(&hs, "/v1/memory/session/turn").await;
+    within(h.shutdown()).await.unwrap();
+    assert_eq!(ends(&hs), 0, "the first run ended nothing");
+
+    // a later run on the same state: the orphan is found, caught up and ended
+    configure(
+        &root,
+        &hs,
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 1000}),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let h = start(&root).await;
+    until("the orphan's end", 15, || ends(&hs) == 1).await;
+    let end = &all(&hs, "/v1/memory/session/end")[0];
+    assert_eq!(end.body["session_id"], format!("openworker/{}", s.id()));
+    assert!(end.body["message_count"].as_i64().unwrap() >= 2);
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_summary_is_asked_for_when_the_server_did_not_make_one_and_summaryonsessionend_can_turn_that_off(
+) {
+    for ask in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let hs = hs_with(false).await;
+        configure(
+            &root,
+            &hs,
+            json!({"autoRecall": false, "sessionBridge": false, "summaryOnSessionEnd": ask}),
+        );
+        let h = start(&root).await;
+        let a = h.create_agent(agent()).await.unwrap();
+        let s = a.new_session_in(workspace(&root)).await.unwrap();
+        within(s.run(SAY)).await.unwrap();
+        within(s.close()).await.unwrap();
+        let end = seen(&hs, "/v1/memory/session/end").await;
+        if ask {
+            let summary = seen(&hs, "/v1/memory/session/summary").await;
+            assert_eq!(summary.body["session_id"], end.body["session_id"]);
+            assert_eq!(summary.body["agent_id"], "tester");
+        } else {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                all(&hs, "/v1/memory/session/summary").is_empty(),
+                "summaryOnSessionEnd is off"
+            );
+        }
+        within(h.shutdown()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_nobody_spoke_in_is_not_ended_on_heliconsearch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(
+        &root,
+        &hs,
+        json!({"autoRecall": false, "sessionBridge": false}),
+    );
+    let h = start(&root).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+    // (the one thing it does on its own is look at the server's recall budgets)
+    let sent: Vec<String> = hs
+        .requests()
+        .into_iter()
+        .map(|r| r.path)
+        .filter(|p| p != "/v1/memory/health")
+        .collect();
+    assert!(sent.is_empty(), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_predates_the_configuration_is_archived_from_its_first_message_when_it_next_has_a_turn(
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    // before memory: a run without any configuration
+    let h = start(&root).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    within(s.run(SAY)).await.unwrap();
+    let reference = s.reference().clone();
+    within(h.shutdown()).await.unwrap();
+
+    // memory is switched on; the old session is resumed
+    let hs = hs().await;
+    configure(
+        &root,
+        &hs,
+        json!({"autoRecall": false, "sessionBridge": false, "endOnShutdown": false}),
+    );
+    // (the agent was registered before memory existed and keeps its definition: an agent id is immutable, so
+    // memory for it would need a new id; its sessions still get recall and capture, just no memory tools)
+    let h = start(&root).await;
+    let s = h.resume(reference).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let sent: Vec<String> = hs
+        .requests()
+        .into_iter()
+        .map(|r| r.path)
+        .filter(|p| p != "/v1/memory/health")
+        .collect();
+    assert!(
+        sent.is_empty(),
+        "attaching an old session alone archives nothing: {sent:?}"
+    );
+    // its next turn sends the whole history, from the very first message
+    within(s.run(SAY)).await.unwrap();
+    let turns = seen(&hs, "/v1/memory/session/turn").await;
+    let indexes: Vec<i64> = turns.body["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["turn_index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(indexes.first(), Some(&0));
+    assert!(
+        indexes.len() >= 3,
+        "the old turn and the new one: {indexes:?}"
+    );
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_the_memory_configuration_changes_the_agent_definition_and_the_sdk_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(&root, &hs, json!({}));
+    let h = start(&root).await;
+    h.create_agent(agent()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+
+    // the same configuration: registering again is safe
+    let h = start(&root).await;
+    h.create_agent(agent()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+
+    // another one (here: the optional store tool): the definition differs, and an agent id is immutable
+    configure(&root, &hs, json!({"memoryStoreTool": true}));
+    let h = start(&root).await;
+    match h.create_agent(agent()).await {
+        Err(Error::AgentDefinitionConflict(conflict)) => {
+            assert_eq!(conflict.agent_id, "assistant");
+            assert!(
+                conflict.conflicting_fields.contains(&"tools".to_owned()),
+                "{conflict:?}"
+            );
+        }
+        other => panic!(
+            "expected a definition conflict, got {:?}",
+            other.map(|a| a.id().to_owned())
+        ),
+    }
+    // a new id works
+    h.create_agent(
+        Agent::new("assistant-v2")
+            .instructions("Be helpful.")
+            .memory(true)
+            .approvals(Approvals::Never),
+    )
+    .await
+    .unwrap();
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_died_moments_ago_is_ended_by_the_idle_sweep_once_it_has_been_quiet_long_enough()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(
+        &root,
+        &hs,
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 600000, "endOnShutdown": false}),
+    );
+    let h = start(&root).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    within(s.run(SAY)).await.unwrap();
+    seen(&hs, "/v1/memory/session/turn").await;
+    within(h.shutdown()).await.unwrap();
+
+    // restarted at once, with a short idle limit: it is too recent to be an orphan, and is not forgotten.
+    // (Its last activity is set to now, so how long the restart took cannot make it old.)
+    let record = root.join(format!("state/helicon-memory/sessions/{}.json", s.id()));
+    let mut saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    saved["lastActive"] = json!(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64);
+    std::fs::write(&record, saved.to_string()).unwrap();
+    configure(
+        &root,
+        &hs,
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 4000}),
+    );
+    let h = start(&root).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(ends(&hs), 0, "still recent");
+    until("the sweep to end it", 20, || ends(&hs) == 1).await;
+    assert_eq!(
+        all(&hs, "/v1/memory/session/end")[0].body["session_id"],
+        format!("openworker/{}", s.id())
+    );
+    within(h.shutdown()).await.unwrap();
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&format!(" {pid} "))
+    }
+    #[cfg(unix)]
+    {
+        // a zombie is dead for this purpose (the field after the command in /proc/<pid>/stat is its state)
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                stat.rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.trim().chars().next())
+                    != Some('Z')
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// The pid of the engine child of a managed harness.
+fn child_pid(h: &Harness) -> u32 {
+    match h.client().connection().borrow().clone() {
+        ConnectionState::Ready {
+            process_id: Some(pid),
+            ..
+        } => pid,
+        other => panic!("no engine child: {other:?}"),
+    }
+}
+
+async fn managed(root: &std::path::Path) -> Harness {
+    Harness::builder()
+        .state_dir(root.join("state"))
+        .executable(runner())
+        .tools(tool::registry())
+        .sandbox(Sandbox::Off)
+        .scripted(true)
+        .managed(runner(), openworker_sdk::RestartPolicy::default())
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_harness_without_shutdown_still_stops_the_engine_with_memory_on_or_off() {
+    for memory in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let hs = hs().await;
+        if memory {
+            configure(&root, &hs, json!({"idleEndMs": 60000}));
+        }
+        let h = managed(&root).await;
+        let pid = child_pid(&h);
+        assert!(process_alive(pid));
+        let a = h.create_agent(agent()).await.unwrap();
+        let s = a.new_session_in(workspace(&root)).await.unwrap();
+        within(s.run(SAY)).await.unwrap();
+        drop((s, a, h));
+        let mut gone = false;
+        for _ in 0..200 {
+            if !process_alive(pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "the engine child {pid} outlived its harness (memory on: {memory})"
+        );
+    }
 }

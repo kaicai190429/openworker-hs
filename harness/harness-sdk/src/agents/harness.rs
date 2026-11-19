@@ -7,7 +7,9 @@ use crate::{
     ClientOptions, Error, HarnessClient, HostConfig, HostProcessConfig, RestartPolicy, Result,
     Sandbox, Storage, TelemetryConfig, ToolRegistry,
 };
+use futures_util::FutureExt;
 use serde_json::json;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -364,9 +366,26 @@ impl Harness {
             return Err(Error::Setup("Host does not support dynamic agents".into()));
         }
         let id = definition.id().to_owned();
-        self.client
+        if let Err(error) = self
+            .client
             .request("agent/register", json!({"agent":definition}))
-            .await?;
+            .await
+        {
+            if let (Error::AgentDefinitionConflict(conflict), false) =
+                (&error, self.extensions.is_empty())
+            {
+                // an extension changes what is registered (tools, instructions, memory): say that, since
+                // the application's own definition may not have changed at all
+                eprintln!(
+                    "openworker: agent '{}' was registered before with a different definition ({}). An attached \
+                     extension (such as HeliconSearch memory) adds to the definition from its configuration: after \
+                     changing that configuration or upgrading the SDK, register the agent under a new id.",
+                    conflict.agent_id,
+                    conflict.conflicting_fields.join(", ")
+                );
+            }
+            return Err(error);
+        }
         Ok(AgentHandle {
             client: self.client.clone(),
             id,
@@ -426,16 +445,21 @@ impl Harness {
         let mut started = Vec::new();
         for ext in list {
             let client = self.client.clone();
-            let result = ext
-                .on_start(StartContext {
-                    harness: self,
-                    client: &client,
-                    state_dir,
-                })
-                .await;
+            // (a panic is a failed start like an error: the extension is left out, the harness goes on)
+            let result = AssertUnwindSafe(ext.on_start(StartContext {
+                harness: self,
+                client: &client,
+                state_dir,
+            }))
+            .catch_unwind()
+            .await;
             match result {
-                Ok(()) => started.push(ext),
-                Err(error) => eprintln!("openworker: extension {} is off: {error}", ext.name()),
+                Ok(Ok(())) => started.push(ext),
+                Ok(Err(error)) => eprintln!("openworker: extension {} is off: {error}", ext.name()),
+                Err(_) => eprintln!(
+                    "openworker: extension {} panicked while starting; it is off",
+                    ext.name()
+                ),
             }
         }
         self.extensions = Extensions::new(started);

@@ -43,6 +43,25 @@ impl HistorySource for HarnessClient {
     }
 }
 
+/// The engine's history held weakly: the extension must not be what keeps an engine running, so a
+/// harness dropped without `shutdown` still stops (the extension's tasks end with it).
+pub(crate) struct WeakEngine(pub std::sync::Weak<crate::Handle>);
+
+impl HistorySource for WeakEngine {
+    fn read<'a>(
+        &'a self,
+        session_id: &'a str,
+        after: usize,
+    ) -> BoxFuture<'a, Result<HistoryPage, String>> {
+        Box::pin(async move {
+            match self.0.upgrade() {
+                Some(inner) => read_history(&HarnessClient { inner }, session_id, after).await,
+                None => Err("the harness is gone".into()),
+            }
+        })
+    }
+}
+
 async fn read_history(
     client: &HarnessClient,
     session_id: &str,

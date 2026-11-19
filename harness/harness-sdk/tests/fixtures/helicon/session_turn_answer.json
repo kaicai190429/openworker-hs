@@ -1,0 +1,33 @@
+{
+  "code": 200,
+  "data": {
+    "archived": 2,
+    "conflicts": 0,
+    "epoch": 1,
+    "errors": 0,
+    "partial": false,
+    "raw_repair_pending": 0,
+    "results": [
+      {
+        "content_hash": "44cf9471d3ebd6e1d20c17758305210d5ec6c0aed91eda33a820fa9c3d91c1b8",
+        "raw_status": "ready",
+        "role": "user",
+        "sql_status": "stored",
+        "turn_id": "c61c374e086546fd93b9a5fc2d818a97",
+        "turn_index": 0
+      },
+      {
+        "content_hash": "24d32eb946700ab760ad3b9bef0213ceca979c660944dad7d4edb023c38104e3",
+        "raw_status": "ready",
+        "role": "assistant",
+        "sql_status": "stored",
+        "turn_id": "68cc8d5bbccf4c068b69c37710f0b6a1",
+        "turn_index": 1
+      }
+    ],
+    "session_id": "openworker/fixture-capture-1795083119-s1",
+    "skipped": 0,
+    "stored": 2,
+    "turn_revision": 2
+  }
+}

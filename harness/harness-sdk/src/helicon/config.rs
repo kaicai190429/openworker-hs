@@ -57,8 +57,7 @@ pub(crate) struct MemoryConfig {
     pub api_key: String,
     pub debug: bool,
     pub sync_transcript: bool,
-    /// Accepted for compatibility with the TypeScript SDK, where it does not change behaviour either.
-    #[allow(dead_code)]
+    /// Ask HeliconSearch for the session's summary right after ending it (when it did not make one itself).
     pub summary_on_session_end: bool,
     pub transcript_max_chars_per_turn: usize,
     pub session_bridge: bool,

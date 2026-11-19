@@ -1,0 +1,18 @@
+{
+  "code": 200,
+  "data": {
+    "bm25": true,
+    "embedding": true,
+    "overall": true,
+    "recall": {
+      "active_budget_ms": 36000,
+      "active_llm_ranker": true,
+      "active_max_rounds": 1,
+      "auto_tier_budget_ms": 12000,
+      "config_fingerprint": "32b79fb45707",
+      "effective_tier": "standard",
+      "refused": null,
+      "speed_tier": "standard"
+    }
+  }
+}

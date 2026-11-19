@@ -29,6 +29,8 @@ mod history;
 mod live_test;
 mod log;
 mod memory_context;
+#[cfg(test)]
+mod real_shapes;
 mod recall;
 mod session_store;
 mod source_ref;
@@ -87,6 +89,22 @@ fn fit_envelopes(text: &str, room: usize) -> Option<String> {
     }
     let cut = cut_bytes(text, room.checked_sub(ENVELOPE_END.len())?);
     (!cut.trim().is_empty()).then(|| format!("{cut}{ENVELOPE_END}"))
+}
+
+/// Takes an ending out of `Inner::ending` and tells its waiters, however its task ends.
+struct EndingGuard {
+    inner: Arc<Inner>,
+    id: String,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for EndingGuard {
+    fn drop(&mut self) {
+        self.inner.ending.lock().unwrap().remove(&self.id);
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+    }
 }
 
 /// The extension for the configuration found for this state directory, if there is one that is on.
@@ -159,7 +177,7 @@ impl Inner {
                 .map(|n| format!("{TOOL_NAMESPACE}.{n}"))
                 .collect(),
             guidance: memory_guidance(&cfg, &short_names),
-            store: Arc::new(Mutex::new(SessionStore::new(root))),
+            store: Arc::new(Mutex::new(SessionStore::new(root, logger.clone()))),
             capture: OnceLock::new(),
             recalled: Mutex::new(BoundedMap::new(SUBMISSION_CACHE_MAX)),
             attached: Mutex::default(),
@@ -369,11 +387,27 @@ impl Inner {
         }
     }
 
-    /// The session is in use: it is not idle, and if it had been ended it is open again.
+    /// The session is in use (a turn is being sent): it is followed, it is not idle, and if it had been
+    /// ended it is open again. (A `close` that failed leaves a session open: this follows it again.)
     fn touch(&self, session_id: &str) {
+        let mut attached = self.attached.lock().unwrap();
+        attached.insert(session_id.to_owned());
+        self.touch_open(session_id);
+    }
+
+    /// The same for a journal event, but only while the session is still open to us: an event that
+    /// arrives as the session is being closed must not reopen it. (Always `attached` first, then the rest.)
+    fn touch_event(&self, session_id: &str) -> bool {
+        let attached = self.attached.lock().unwrap();
+        if !attached.contains(session_id) {
+            return false;
+        }
+        self.touch_open(session_id);
+        true
+    }
+
+    fn touch_open(&self, session_id: &str) {
         self.known.lock().unwrap().insert(session_id.to_owned());
-        // (a `close` that failed leaves the session open: it is followed again)
-        self.attached.lock().unwrap().insert(session_id.to_owned());
         let mut store = self.store.lock().unwrap();
         let rec = store.get(session_id);
         let now = now_ms();
@@ -389,13 +423,13 @@ impl Inner {
         match notification {
             Notification::Event(e) => {
                 let id = &e.session_id;
-                if self.excluded.lock().unwrap().contains(id)
-                    || !self.attached.lock().unwrap().contains(id)
-                {
+                if self.excluded.lock().unwrap().contains(id) {
                     return;
                 }
                 // any event is activity: a turn that runs longer than the idle limit is not idle
-                self.touch(id); // also makes the session known
+                if !self.touch_event(id) {
+                    return; // not a session that went through a Session, or one that is closed
+                }
                 if e.kind == "turn_completed" {
                     if let Some(capture) = self.capture() {
                         capture.schedule(id);
@@ -457,15 +491,15 @@ impl Inner {
         let inner = self.clone();
         let id = session_id.to_owned();
         tokio::spawn(async move {
+            // (a guard, so a panic in the work cannot leave a finished ending in the map for good)
+            let _ending = EndingGuard {
+                inner: inner.clone(),
+                id: id.clone(),
+                done: Some(done),
+            };
             inner.end_session_work(&id, wait_for_extraction_ms).await;
-            inner.ending.lock().unwrap().remove(&id);
-            let _ = done.send(());
         });
         finished
-    }
-
-    fn end_session_detached(self: &Arc<Self>, session_id: &str, wait_for_extraction_ms: u64) {
-        drop(self.end_session(session_id, wait_for_extraction_ms));
     }
 
     async fn end_session_work(&self, session_id: &str, wait_for_extraction_ms: u64) {
@@ -522,7 +556,8 @@ impl Inner {
             "{TAG} session end status={status} memory_id={} session={hs_id}",
             memory_id.unwrap_or("none")
         ));
-        if status == "closed" && memory_id.is_none() {
+        // (the server also summarises on its own; summaryOnSessionEnd off leaves it at that)
+        if status == "closed" && memory_id.is_none() && cfg.summary_on_session_end {
             // the summary is made on the server: ask for it, without waiting
             let (client, logger) = (self.client.clone(), self.logger.clone());
             let request = json!({"session_id": hs_id, "agent_id": cfg.agent_id, "project_id": cfg.project_id});
@@ -550,16 +585,27 @@ impl Inner {
         }
         if self.cfg.sync_transcript {
             let wait = self.cfg.close_wait_ms;
-            let _ = tokio::time::timeout(
+            if tokio::time::timeout(
                 Duration::from_millis(wait + CLOSE_MARGIN_MS),
                 self.end_session(id, wait),
             )
-            .await;
+            .await
+            .is_err()
+            {
+                self.logger.warn(&format!(
+                    "{TAG} closing session {id}: HeliconSearch did not answer in time; the end carries on in the background"
+                ));
+            }
         } else if let Some(capture) = self.capture() {
             // (not ended on HeliconSearch, but the last turn is not left behind with the debounce timer)
-            let _ =
-                tokio::time::timeout(Duration::from_millis(CLOSE_MARGIN_MS), capture.flush(id, 0))
-                    .await;
+            if tokio::time::timeout(Duration::from_millis(CLOSE_MARGIN_MS), capture.flush(id, 0))
+                .await
+                .is_err()
+            {
+                self.logger.warn(&format!(
+                    "{TAG} closing session {id}: the last turn could not be sent in time; it is sent at the next flush"
+                ));
+            }
         }
         if let Some(capture) = self.capture() {
             capture.release(id);
@@ -581,7 +627,18 @@ impl Inner {
                 !rec.ended && now.saturating_sub(rec.last_active) >= limit
             };
             if idle {
-                self.end_session_detached(&id, 0);
+                let inner = self.clone();
+                tokio::spawn(async move {
+                    inner.end_session(&id, 0).await;
+                    let ended = inner.store.lock().unwrap().get(&id).ended;
+                    if ended {
+                        // quiet and ended: nothing of it needs to stay in memory until its next turn
+                        if let Some(capture) = inner.capture() {
+                            capture.release(&id);
+                        }
+                        inner.known.lock().unwrap().remove(&id);
+                    }
+                });
             }
         }
     }
@@ -593,32 +650,49 @@ impl Inner {
         if !self.cfg.sync_transcript || limit == 0 {
             return;
         }
+        enum Kind {
+            /// Nothing to end: ended already, or nothing was ever archived.
+            Settled,
+            /// A run died moments ago: the idle sweep ends it once it has been quiet for the limit.
+            Recent,
+            Orphan,
+        }
         let live: HashSet<String> = self.known_sessions().into_iter().collect();
         let saved = self.store.lock().unwrap().list();
-        let mut ended = 0;
+        let (mut ended, mut tried) = (0, 0);
         for id in saved {
-            if ended >= ORPHANS_PER_START {
+            // (a session that cannot be ended, say its engine record is gone, does not use up the others' turn)
+            if ended >= ORPHANS_PER_START || tried >= 3 * ORPHANS_PER_START {
                 break;
             }
             if live.contains(&id) {
                 continue;
             }
-            let orphan = {
+            let kind = {
                 let mut store = self.store.lock().unwrap();
                 let rec = store.get(&id);
-                let skip = rec.ended
-                    || rec.archive_next == 0
-                    || now_ms().saturating_sub(rec.last_active) < limit;
-                if skip {
+                if rec.ended || rec.archive_next == 0 {
                     store.forget(&id);
+                    Kind::Settled
+                } else if now_ms().saturating_sub(rec.last_active) < limit {
+                    Kind::Recent
+                } else {
+                    Kind::Orphan
                 }
-                !skip
             };
-            if !orphan {
-                continue;
+            match kind {
+                Kind::Settled => continue,
+                Kind::Recent => {
+                    self.known.lock().unwrap().insert(id);
+                    continue;
+                }
+                Kind::Orphan => {}
             }
-            ended += 1;
+            tried += 1;
             self.end_session(&id, 0).await;
+            if self.store.lock().unwrap().get(&id).ended {
+                ended += 1;
+            }
             if let Some(capture) = self.capture() {
                 capture.release(&id);
             }
@@ -647,11 +721,18 @@ impl Inner {
                 }
             }
         });
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             Duration::from_millis(SHUTDOWN_BUDGET_MS),
             futures_util::future::join_all(work),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            self.logger.warn(&format!(
+                "{TAG} shutdown: HeliconSearch did not answer within {}s; what is pending is sent at the next start",
+                SHUTDOWN_BUDGET_MS / 1000
+            ));
+        }
     }
 }
 
@@ -673,7 +754,7 @@ impl Extension for HeliconExtension {
                 cfg: inner.cfg.clone(),
                 client: inner.client.clone(),
                 store: inner.store.clone(),
-                history: Arc::new(ctx.client.clone()),
+                history: Arc::new(history::WeakEngine(Arc::downgrade(&ctx.client.inner))),
                 logger: inner.logger.clone(),
                 own_tool_prefix: MODEL_TOOL_PREFIX,
             });
@@ -714,13 +795,17 @@ impl Extension for HeliconExtension {
             }));
             if inner.cfg.idle_end_ms > 0 && inner.cfg.sync_transcript {
                 let period = (inner.cfg.idle_end_ms / 2).clamp(1_000, 60_000);
-                let sweeper = inner.clone();
+                let sweeper = Arc::downgrade(inner);
                 tasks.push(tokio::spawn(async move {
                     let mut tick = tokio::time::interval(Duration::from_millis(period));
                     tick.tick().await;
                     loop {
                         tick.tick().await;
-                        sweeper.sweep_idle();
+                        // (weak: a harness that is dropped takes its extension, and this task, with it)
+                        let Some(inner) = sweeper.upgrade() else {
+                            break;
+                        };
+                        inner.sweep_idle();
                     }
                 }));
                 let orphans = inner.clone();
@@ -1098,12 +1183,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_a_session_with_nothing_said_ends_nothing() {
-        let hs = MockHs::start(|req| panic!("unexpected {}", req.path)).await;
+    async fn a_server_that_hangs_costs_a_turn_no_more_than_its_time_budget() {
+        let hs = MockHs::start(|req| match req.path.as_str() {
+            "/v1/memory/query" => {
+                Reply::ok(json!({"grounded_facts": []})).after(Duration::from_secs(8))
+            }
+            other => panic!("unexpected {other}"),
+        })
+        .await;
         let dir = tempfile::tempdir().unwrap();
-        let ext = extension(&hs, dir.path(), json!({}));
-        // closing before the harness is up (no capture engine) must not fail or call out
-        ext.before_close(&session("s1")).await;
-        assert!(hs.requests().is_empty());
+        // hookTimeoutMs 2000: the recall may take 900ms on the server, 1.7s in all, then the turn goes on
+        let ext = extension(
+            &hs,
+            dir.path(),
+            json!({"sessionBridge": false, "hookTimeoutMs": 2000}),
+        );
+        let started = std::time::Instant::now();
+        let text = turn(
+            &ext,
+            &session("s1"),
+            "a",
+            "what do I like to drink?",
+            Some("mine"),
+        )
+        .await;
+        assert_eq!(text.as_deref(), Some("mine"));
+        assert!(
+            started.elapsed() < Duration::from_millis(3_500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(hs.requests().len(), 1, "it was asked, and not waited for");
+    }
+
+    /// An extension with its capture engine up (what `on_start` does), over a history the test controls.
+    fn with_capture(
+        ext: &HeliconExtension,
+        items: Vec<(usize, serde_json::Value)>,
+    ) -> Arc<test_support::FakeHistory> {
+        let inner = &ext.inner;
+        let history = Arc::new(test_support::FakeHistory::new(items));
+        let _ = inner.capture.set(CaptureEngine::new(CaptureDeps {
+            cfg: inner.cfg.clone(),
+            client: inner.client.clone(),
+            store: inner.store.clone(),
+            history: history.clone(),
+            logger: inner.logger.clone(),
+            own_tool_prefix: MODEL_TOOL_PREFIX,
+        }));
+        history
+    }
+
+    fn capture_hs() -> impl Fn(&test_support::Request) -> Reply + Send + Sync + 'static {
+        |req| match req.path.as_str() {
+            "/v1/memory/session/start" => Reply::ok(json!({})),
+            "/v1/memory/session/turn" => {
+                let results: Vec<serde_json::Value> = req.body["turns"].as_array().unwrap().iter()
+                    .map(|t| json!({"turn_index": t["turn_index"], "sql_status": "stored", "turn_id": "t", "content_hash": "h"}))
+                    .collect();
+                Reply::ok(json!({"results": results}))
+            }
+            "/v1/memory/add" => {
+                Reply::ok(json!({"code": 202, "queued": true, "work_unit_id": "w"}))
+            }
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    fn turns_sent(hs: &MockHs) -> usize {
+        hs.requests()
+            .iter()
+            .filter(|r| r.path == "/v1/memory/session/turn")
+            .count()
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    }
+
+    #[tokio::test]
+    async fn journal_events_only_count_for_sessions_that_went_through_a_session_and_gaps_are_made_good(
+    ) {
+        use crate::Notification;
+        let hs = MockHs::start(capture_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({"sessionBridge": false}));
+        let history = with_capture(
+            &ext,
+            vec![(0, json!({"role": "user", "content": "I prefer dark mode"}))],
+        );
+        let event = |session: &str, kind: &str| {
+            Notification::Event(crate::Event {
+                event_id: 1,
+                session_id: session.into(),
+                turn_id: None,
+                kind: kind.into(),
+                data: json!({}),
+            })
+        };
+        let inner = &ext.inner;
+
+        // a team worker the SDK attached on its own: its events and its recovery are not ours
+        inner.on_notification(event("worker-1", "turn_completed"));
+        inner.on_notification(Notification::Recovered {
+            session_id: "worker-1".into(),
+            snapshot: json!({}),
+        });
+        settle().await;
+        assert_eq!(turns_sent(&hs), 0);
+
+        // the lead session: a completed turn is archived
+        ext.on_session_created(&session("lead-1"));
+        inner.on_notification(event("lead-1", "turn_started"));
+        settle().await;
+        assert_eq!(
+            turns_sent(&hs),
+            0,
+            "only a completed turn schedules a capture"
+        );
+        inner.on_notification(event("lead-1", "turn_completed"));
+        settle().await;
+        assert_eq!(turns_sent(&hs), 1);
+
+        // events were lost (a gap, a lagging receiver, a restarted engine): the history is looked at again
+        history
+            .items
+            .lock()
+            .unwrap()
+            .push((1, json!({"role": "user", "content": "and I like tea"})));
+        inner.on_notification(Notification::Gap);
+        settle().await;
+        assert_eq!(turns_sent(&hs), 2);
+        history
+            .items
+            .lock()
+            .unwrap()
+            .push((2, json!({"role": "user", "content": "and coffee"})));
+        inner.on_notification(Notification::Recovered {
+            session_id: "lead-1".into(),
+            snapshot: json!({}),
+        });
+        settle().await;
+        assert_eq!(turns_sent(&hs), 3);
+        history
+            .items
+            .lock()
+            .unwrap()
+            .push((3, json!({"role": "user", "content": "and juice"})));
+        inner.resync(None);
+        settle().await;
+        assert_eq!(turns_sent(&hs), 4);
+        let last = hs
+            .requests()
+            .into_iter()
+            .rfind(|r| r.path == "/v1/memory/session/turn")
+            .unwrap();
+        assert_eq!(last.body["turns"][0]["turn_index"], 3, "only what is new");
+    }
+
+    #[tokio::test]
+    async fn a_session_of_an_agent_left_out_is_never_captured_even_by_a_gap() {
+        use crate::Notification;
+        let hs = MockHs::start(capture_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({"agents": ["lead"]}));
+        with_capture(
+            &ext,
+            vec![(0, json!({"role": "user", "content": "I prefer dark mode"}))],
+        );
+        let other = SessionInfo {
+            session_id: "other-1".into(),
+            agent: "other".into(),
+        };
+        ext.on_session_created(&other);
+        ext.on_session_attached(&other);
+        ext.inner.on_notification(Notification::Gap);
+        ext.inner.on_notification(Notification::Recovered {
+            session_id: "other-1".into(),
+            snapshot: json!({}),
+        });
+        settle().await;
+        assert!(hs.requests().is_empty(), "{:?}", hs.requests());
     }
 }

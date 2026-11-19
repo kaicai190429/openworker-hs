@@ -1,0 +1,321 @@
+{
+  "code": 200,
+  "data": {
+    "category_summaries": [
+      {
+        "avg_importance": 0.85,
+        "category_hint": "sample category_hint 1",
+        "conflict_ids": [],
+        "coverage": {
+          "retired": 0,
+          "summarized": 2,
+          "version": "b545b0ddb892c70c"
+        },
+        "last_refreshed_at": "2026-11-18T06:48:47.192761",
+        "memory_count": 2,
+        "source_memory_ids": [
+          "b19c26f3544347c9b334d956858dc52d",
+          "2df497bb787746b989718bb6bc5699ba"
+        ],
+        "summary": "sample summary 2",
+        "topic_name": "sample topic_name 3",
+        "version": "cf40ad4275bddff4"
+      },
+      {
+        "avg_importance": 0.85,
+        "category_hint": "sample category_hint 4",
+        "conflict_ids": [],
+        "coverage": {
+          "retired": 0,
+          "summarized": 2,
+          "version": "b545b0ddb892c70c"
+        },
+        "last_refreshed_at": "2026-11-18T07:18:55.286344",
+        "memory_count": 2,
+        "source_memory_ids": [
+          "b19c26f3544347c9b334d956858dc52d",
+          "2df497bb787746b989718bb6bc5699ba"
+        ],
+        "summary": "sample summary 5",
+        "topic_name": "sample topic_name 6",
+        "version": "ba79866dfb8c2d6d"
+      }
+    ],
+    "conflict_limit": 5,
+    "conflicts": [],
+    "is_empty": false,
+    "pinned_semantics": [
+      {
+        "access_count": 3,
+        "agent_id": "openworker",
+        "category": "preference",
+        "coherence_score": null,
+        "confidence": 1.0,
+        "confirm_count": 0,
+        "conflict_ids": [],
+        "create_time": 1794984522,
+        "extraction_method": "operator",
+        "group_id": "openworker/smoke-1794984505012/seg_0",
+        "id": "b19c26f3544347c9b334d956858dc52d",
+        "importance": 0.85,
+        "last_accessed_at": "2026-11-19T09:30:07.553859",
+        "lifecycle_state": "active",
+        "memory_type": "semantic",
+        "metadata": {
+          "bucket": "PROFILE",
+          "derivation_level": "atomic",
+          "dimension": "H-PROFILE",
+          "evidence": [
+            {
+              "quote": "sample quote 7",
+              "session_datetime": "",
+              "session_id": "openworker/smoke-1794984505012",
+              "speaker": "user",
+              "support_type": "explicit",
+              "turn_index": 0
+            }
+          ],
+          "evidence_quote_exact": true,
+          "evidence_quote_match_score": 1.0,
+          "evidence_quote_raw": "My favourite color is teal",
+          "generated_by": "local_llm",
+          "pass": "rewrite",
+          "source_gate": {
+            "decision": "authorized",
+            "kind": "user_direct",
+            "method": "exact",
+            "policy": "b1.5",
+            "score": 1.0,
+            "user_turn_index": 0
+          },
+          "subject": "user",
+          "support_type": "explicit",
+          "tags": [
+            "color",
+            "preference"
+          ]
+        },
+        "project_id": "",
+        "recall_count": 3,
+        "scope": "project",
+        "session_id": "openworker/smoke-1794984505012",
+        "source_completeness": "full_session",
+        "source_refs": [
+          {
+            "ref_id": "openworker/smoke-1794984505012",
+            "type": "session"
+          }
+        ],
+        "supersedes": null,
+        "text": "sample text 8",
+        "topic_name": "sample topic_name 9",
+        "unique_query_count": 2,
+        "update_time": 1794984522,
+        "useful_count": 0,
+        "useless_count": 0,
+        "version": "d620f7938ef99081"
+      },
+      {
+        "access_count": 3,
+        "agent_id": "openworker",
+        "category": "preference",
+        "coherence_score": null,
+        "confidence": 1.0,
+        "confirm_count": 0,
+        "conflict_ids": [],
+        "create_time": 1794984522,
+        "extraction_method": "operator",
+        "group_id": "openworker/smoke-1794984505012/seg_0",
+        "id": "2df497bb787746b989718bb6bc5699ba",
+        "importance": 0.85,
+        "last_accessed_at": "2026-11-19T09:30:07.553859",
+        "lifecycle_state": "active",
+        "memory_type": "semantic",
+        "metadata": {
+          "bucket": "PROFILE",
+          "derivation_level": "atomic",
+          "dimension": "H-PROFILE",
+          "evidence": [
+            {
+              "quote": "sample quote 10",
+              "session_datetime": "",
+              "session_id": "openworker/smoke-1794984505012",
+              "speaker": "user",
+              "support_type": "explicit",
+              "turn_index": 0
+            }
+          ],
+          "evidence_quote_exact": true,
+          "evidence_quote_match_score": 1.0,
+          "evidence_quote_raw": "I live in Chengdu",
+          "generated_by": "local_llm",
+          "pass": "rewrite",
+          "source_gate": {
+            "decision": "authorized",
+            "kind": "user_direct",
+            "method": "exact",
+            "policy": "b1.5",
+            "score": 1.0,
+            "user_turn_index": 0
+          },
+          "subject": "user",
+          "support_type": "explicit",
+          "tags": [
+            "location",
+            "residence"
+          ]
+        },
+        "project_id": "",
+        "recall_count": 3,
+        "scope": "project",
+        "session_id": "openworker/smoke-1794984505012",
+        "source_completeness": "full_session",
+        "source_refs": [
+          {
+            "ref_id": "openworker/smoke-1794984505012",
+            "type": "session"
+          }
+        ],
+        "supersedes": null,
+        "text": "sample text 11",
+        "topic_name": "sample topic_name 12",
+        "unique_query_count": 2,
+        "update_time": 1794984522,
+        "useful_count": 0,
+        "useless_count": 0,
+        "version": "914f4acb77ee5093"
+      },
+      {
+        "access_count": 2,
+        "agent_id": "openworker",
+        "category": "preference",
+        "coherence_score": null,
+        "confidence": 1.0,
+        "confirm_count": 0,
+        "conflict_ids": [],
+        "create_time": 1794986335,
+        "extraction_method": "operator",
+        "group_id": "openworker/smoke-1794984505012/seg_0",
+        "id": "1ee4237b99dc4aedb0015fe173f3b05d",
+        "importance": 0.85,
+        "last_accessed_at": "2026-11-19T09:30:07.553859",
+        "lifecycle_state": "active",
+        "memory_type": "semantic",
+        "metadata": {
+          "bucket": "PROFILE",
+          "derivation_level": "atomic",
+          "dimension": "H-PROFILE",
+          "evidence": [
+            {
+              "quote": "sample quote 13",
+              "session_datetime": "2026-11-18T06:48:25.057Z",
+              "session_id": "openworker/smoke-1794984505012",
+              "speaker": "user",
+              "support_type": "explicit",
+              "turn_index": 2
+            }
+          ],
+          "evidence_quote_exact": true,
+          "evidence_quote_match_score": 1.0,
+          "evidence_quote_raw": "I like noodles",
+          "generated_by": "local_llm",
+          "pass": "rewrite",
+          "source_gate": {
+            "decision": "authorized",
+            "kind": "user_direct",
+            "method": "exact",
+            "policy": "b1.5",
+            "score": 1.0,
+            "user_turn_index": 2
+          },
+          "subject": "user",
+          "support_type": "explicit",
+          "tags": [
+            "food",
+            "preference"
+          ]
+        },
+        "project_id": "",
+        "recall_count": 2,
+        "scope": "project",
+        "session_id": "openworker/smoke-1794984505012",
+        "source_completeness": "full_session",
+        "source_refs": [
+          {
+            "ref_id": "openworker/smoke-1794984505012",
+            "type": "session"
+          }
+        ],
+        "supersedes": null,
+        "text": "sample text 14",
+        "topic_name": "sample topic_name 15",
+        "unique_query_count": 1,
+        "update_time": 1794986335,
+        "useful_count": 0,
+        "useless_count": 0,
+        "version": "2e2328c395d89874"
+      }
+    ],
+    "procedures": [],
+    "protocol": "bridge.v2",
+    "recent_episodes": [
+      {
+        "access_count": 2,
+        "agent_id": "openworker",
+        "category": "episode",
+        "coherence_score": null,
+        "confidence": 1.0,
+        "confirm_count": 0,
+        "create_time": 1794984830,
+        "extraction_method": "session_summary",
+        "group_id": null,
+        "id": "3051b7b492a647c4b61a7990447269fd",
+        "importance": 0.4,
+        "last_accessed_at": "2026-11-19T09:30:07.553859",
+        "lifecycle_state": "active",
+        "memory_type": "episodic",
+        "metadata": {
+          "session_summary": {
+            "epoch": 2,
+            "fingerprint": "5e89706087c115bb441f2844587c96f1fce8add13cbfbe22fb421a6921b960c7",
+            "generation": 1,
+            "job_id": "5342f4fe05d8439e92f9cbb96ca98d8b",
+            "source": "generated",
+            "turn_count": 3,
+            "turn_revision": 3
+          }
+        },
+        "project_id": "",
+        "recall_count": 2,
+        "scope": "project",
+        "session_id": "openworker/smoke-1794984505012",
+        "session_summary": {
+          "covered_turns": 3,
+          "fingerprint": "5e89706087c115bb441f2844587c96f1fce8add13cbfbe22fb421a6921b960c7",
+          "generation": 1,
+          "later_turns": 0,
+          "session_datetime": "2026-11-18T06:48:25.057Z",
+          "session_id": "openworker/smoke-1794984505012",
+          "session_status": "auto_closed",
+          "source": "generated",
+          "stale": false
+        },
+        "source_completeness": "full_session",
+        "source_refs": [
+          {
+            "ref_id": "openworker/smoke-1794984505012",
+            "type": "session"
+          }
+        ],
+        "supersedes": null,
+        "text": "sample text 16",
+        "topic_name": "sample topic_name 17",
+        "unique_query_count": 1,
+        "update_time": 1794984830,
+        "useful_count": 0,
+        "useless_count": 0,
+        "version": "b188221d807f89cd"
+      }
+    ]
+  }
+}

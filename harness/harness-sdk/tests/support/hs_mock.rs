@@ -1,8 +1,16 @@
-//! A fake HeliconSearch for the integration tests: a loopback HTTP server that answers with what a
-//! closure says and records every request it gets. (The unit tests have their own copy in the crate.)
+//! A fake HeliconSearch for the integration tests (the unit tests have their own copy in the crate): a loopback HTTP server that answers with what a closure says and
+//! records every request it gets.
+//!
+//! A handler that panics (an `assert!`, or `panic!("unexpected ...")` for a path it does not know) does
+//! not vanish into a dropped connection: the server answers 500, remembers the message, and the test
+//! fails when the server is dropped.
 #![allow(dead_code)]
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -20,21 +28,44 @@ pub struct Request {
 pub struct Reply {
     status: u16,
     body: Value,
+    delay: Duration,
 }
 
 impl Reply {
     /// HTTP 200 with this JSON as it is.
     pub fn ok(body: Value) -> Self {
-        Self { status: 200, body }
+        Self {
+            status: 200,
+            body,
+            delay: Duration::ZERO,
+        }
     }
     pub fn status(status: u16, body: Value) -> Self {
-        Self { status, body }
+        Self {
+            status,
+            body,
+            delay: Duration::ZERO,
+        }
+    }
+    /// The same answer, after this long (a slow server).
+    pub fn after(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 }
 
 pub struct MockHs {
     port: u16,
     seen: Arc<Mutex<Vec<Request>>>,
+    failures: Arc<Mutex<Vec<String>>>,
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_else(|| "a handler panicked".into())
 }
 
 impl MockHs {
@@ -42,15 +73,15 @@ impl MockHs {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().unwrap().port();
         let seen: Arc<Mutex<Vec<Request>>> = Arc::default();
+        let failures: Arc<Mutex<Vec<String>>> = Arc::default();
         let handler = Arc::new(handler);
-        let log = seen.clone();
+        let (log, problems) = (seen.clone(), failures.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                let handler = handler.clone();
-                let log = log.clone();
+                let (handler, log, problems) = (handler.clone(), log.clone(), problems.clone());
                 tokio::spawn(async move {
                     let mut buf: Vec<u8> = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -95,7 +126,22 @@ impl MockHs {
                         auth,
                     };
                     log.lock().unwrap().push(request.clone());
-                    let reply = handler(&request);
+                    let reply = match catch_unwind(AssertUnwindSafe(|| handler(&request))) {
+                        Ok(reply) => reply,
+                        Err(payload) => {
+                            let text = format!(
+                                "{} {}: {}",
+                                request.method,
+                                request.path,
+                                panic_text(payload.as_ref())
+                            );
+                            problems.lock().unwrap().push(text.clone());
+                            Reply::status(500, serde_json::json!({"error": text}))
+                        }
+                    };
+                    if !reply.delay.is_zero() {
+                        tokio::time::sleep(reply.delay).await;
+                    }
                     let payload = reply.body.to_string();
                     let response = format!(
                         "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
@@ -107,7 +153,11 @@ impl MockHs {
                 });
             }
         });
-        Self { port, seen }
+        Self {
+            port,
+            seen,
+            failures,
+        }
     }
 
     pub fn url(&self) -> String {
@@ -116,5 +166,17 @@ impl MockHs {
 
     pub fn requests(&self) -> Vec<Request> {
         self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for MockHs {
+    fn drop(&mut self) {
+        let failures = self.failures.lock().unwrap().clone();
+        if !failures.is_empty() && !std::thread::panicking() {
+            panic!(
+                "the fake HeliconSearch's handler failed: {}",
+                failures.join("; ")
+            );
+        }
     }
 }

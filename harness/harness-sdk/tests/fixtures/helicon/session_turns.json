@@ -1,0 +1,26 @@
+{
+  "code": 200,
+  "data": {
+    "first_turn": 0,
+    "last_turn": 1,
+    "more": false,
+    "session_id": "openworker/fixture-capture-1795083119-s1",
+    "total": 2,
+    "turns": [
+      {
+        "content": "My favorite tea is jasmine green tea, and I take it without sugar.",
+        "created_at": "2026-11-19T10:00:01.000Z",
+        "omitted": false,
+        "role": "user",
+        "turn_index": 0
+      },
+      {
+        "content": "Noted: jasmine green tea, no sugar.",
+        "created_at": "2026-11-19T10:00:02.000Z",
+        "omitted": false,
+        "role": "assistant",
+        "turn_index": 1
+      }
+    ]
+  }
+}

@@ -25,6 +25,7 @@ multiple agents and remote service deployments as your application grows.
 | Images, PDFs and text files | [Attachments](attachments.md) |
 | Control over actions and sensitive content | [Approvals](alignment.md) · [Guardrails and hooks](guardrails.md) |
 | Visibility into latency, token usage and failures | [Observability](observability.md) |
+| Long-term memory across sessions (Rust SDK) | [HeliconSearch memory](helicon-memory-rust.md) |
 
 Choose cloud or local models. Run the Rust harness in-process in a Rust application,
 or as a managed child process through the TypeScript SDK. A browser talks to your

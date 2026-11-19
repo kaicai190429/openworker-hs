@@ -1,0 +1,189 @@
+{
+  "already_processed": false,
+  "archive_conflicts": [],
+  "archive_mismatched": [],
+  "audit": {
+    "archive": {
+      "archived": true,
+      "bound": 2,
+      "conflicts": [],
+      "context": 0,
+      "from": 0,
+      "mismatched": [],
+      "not_archived": [],
+      "owned": true,
+      "passive": 0,
+      "processed": 0,
+      "settled_turns": [],
+      "through": 1,
+      "unbound": 0
+    },
+    "claim_relations": {
+      "calls": 0,
+      "judged": 0,
+      "rejected": [],
+      "status": "ok"
+    },
+    "claim_rule": "exact.v1",
+    "context": {
+      "reason": "no earlier turn",
+      "source": "none",
+      "target_turn_index": 0
+    },
+    "coverage": {
+      "covered_count": 2,
+      "ratio": 1.0,
+      "total_count": 2
+    },
+    "forgotten": {
+      "cut": [],
+      "dropped": []
+    },
+    "image_format": "parenthetical",
+    "ingest_mode": "agent",
+    "message_count": 2,
+    "pass2_mode": "rewrite",
+    "processing": {
+      "attempts": 1,
+      "origin": "add",
+      "outcome": "extracted",
+      "policy": {
+        "claim_identity": "exact.v1",
+        "claim_relations": "relations.v3",
+        "extraction": {
+          "claim_rule": "exact.v1",
+          "image_format": "parenthetical",
+          "language_rule": "aceaaa65765a",
+          "model": "helicon",
+          "pass2_mode": "rewrite",
+          "prompts": "c3d6d68dc26554d8",
+          "variant": "hybrid5"
+        },
+        "mode": "agent",
+        "source_gate": "b1.5",
+        "store_gate": true
+      },
+      "raw_windows_marked": 1,
+      "reason": "",
+      "state": "extracted",
+      "turns": 2,
+      "turns_marked": 1,
+      "work_unit_id": "9591b352f5e14649a1610ebb549a00a7"
+    },
+    "segment_mode": "topic",
+    "segments": [
+      {
+        "end": 1,
+        "lang": "en",
+        "merged": 1,
+        "pass1": 2,
+        "pass2": 0,
+        "seg_idx": 0,
+        "start": 0,
+        "summary": "1 user: favorite tea is jasmine green tea without sugar | 2 assistant: noted tea preference"
+      }
+    ],
+    "segments_count": 1,
+    "source_gate": {
+      "counts": {
+        "authorized": 1,
+        "blocked_ai": 1
+      },
+      "held": [
+        {
+          "action": "",
+          "ai_turn_index": null,
+          "claim": "assistant noted user's tea preference.",
+          "decision": "blocked_ai",
+          "status": null,
+          "user_turn_index": null
+        }
+      ],
+      "policy": "b1.5",
+      "relations": {}
+    },
+    "store_gate": {
+      "blocked": 0,
+      "elapsed_ms": 2579.6,
+      "judged": 1,
+      "llm_ok": true,
+      "per_turn": [
+        {
+          "act": "tells",
+          "reason": "User states a personal preference.",
+          "store": true,
+          "turn_index": 0,
+          "user": "My favorite tea is jasmine green tea, and I take it without sugar."
+        }
+      ],
+      "reason": "User states a personal preference.",
+      "user_turns": 1,
+      "verdict": "store"
+    },
+    "store_gate_request": {
+      "effective": true,
+      "ignored": true,
+      "requested": false
+    },
+    "totals": {
+      "accepted_total": 1,
+      "claim_dedupe": {
+        "dropped": {
+          "cross_segment_union": 0,
+          "pass1": 0,
+          "rewrite": 0,
+          "segment_union": 0
+        },
+        "rule": "exact.v1"
+      },
+      "empty_reask": {
+        "asked": 0,
+        "recovered": 0
+      },
+      "final_facts": 1,
+      "llm_calls": 1,
+      "llm_failures": 0,
+      "merged_total": 1,
+      "pass1_total": 2,
+      "pass2_total": 0,
+      "raw_total": 2,
+      "rejected_total": 0
+    },
+    "variant": "hybrid5"
+  },
+  "code": 200,
+  "data": [
+    {
+      "action": "ADD",
+      "decision": "created",
+      "fact": "user's favorite tea is jasmine green tea without sugar.",
+      "memory_id": "d443f666e9e245459fb03c91265e0071",
+      "reason": "hybrid5 rewrite",
+      "status": "created"
+    }
+  ],
+  "not_archived": [],
+  "raw_windows_marked": 1,
+  "turns": [
+    {
+      "reason": null,
+      "role": "user",
+      "state": "processed",
+      "turn_id": "c61c374e086546fd93b9a5fc2d818a97",
+      "turn_index": 0,
+      "work_unit_id": "9591b352f5e14649a1610ebb549a00a7"
+    },
+    {
+      "reason": "context",
+      "role": "assistant",
+      "state": "processed_no_claim",
+      "turn_id": "68cc8d5bbccf4c068b69c37710f0b6a1",
+      "turn_index": 1,
+      "work_unit_id": "9591b352f5e14649a1610ebb549a00a7"
+    }
+  ],
+  "work_unit_id": "9591b352f5e14649a1610ebb549a00a7",
+  "work_units": [
+    "9591b352f5e14649a1610ebb549a00a7"
+  ]
+}

@@ -45,8 +45,8 @@ async fn live_memory_round_trip() {
         std::env::var("HELICON_LIVE_URL"),
         std::env::var("HELICON_LIVE_TOKEN"),
     ) else {
-        eprintln!("skipped: HELICON_LIVE_URL / HELICON_LIVE_TOKEN not set");
-        return;
+        // run on purpose (--ignored): a silent pass would claim a check that did not happen
+        panic!("set HELICON_LIVE_URL and HELICON_LIVE_TOKEN to run the live tests");
     };
     let agent = format!("rust-live-{}", now_ms());
     let dir = tempfile::tempdir().unwrap();
@@ -141,6 +141,7 @@ async fn live_memory_round_trip() {
     ];
     let store = Arc::new(Mutex::new(SessionStore::new(
         dir.path().join("helicon-memory"),
+        inner.logger.clone(),
     )));
     let engine = CaptureEngine::new(CaptureDeps {
         cfg: cfg.clone(),
@@ -200,6 +201,51 @@ async fn live_memory_round_trip() {
         "the server accepted the slice: {added:?}"
     );
 
+    // a memory the operator made has source turns: memory_get shows the conversation it came from
+    let made = added
+        .operations
+        .iter()
+        .find_map(|op| op["memory_id"].as_str())
+        .map(str::to_owned);
+    if let Some(id) = &made {
+        let opened = inner
+            .tools
+            .memory_get(&json!({"memoryId": id}), "live#source")
+            .await;
+        eprintln!("memory_get (operator memory): {opened}");
+        assert!(
+            opened.contains(&format!("Source sessions: {hs_session}")),
+            "{opened}"
+        );
+        assert!(
+            opened.contains("source of this memory"),
+            "the source message is marked: {opened}"
+        );
+        assert!(
+            opened.contains("I prefer oolong tea in the evening"),
+            "{opened}"
+        );
+        // forgetting by description: one strong match goes, several are listed, none is said
+        let forgot = inner
+            .tools
+            .memory_forget(&json!({"query": "oolong tea in the evening"}))
+            .await;
+        eprintln!("memory_forget (by query): {forgot}");
+        assert!(
+            forgot.starts_with("Forgotten:")
+                || forgot.starts_with("Found ")
+                || forgot == "No matching memories found.",
+            "{forgot}"
+        );
+    }
+    // a skill id the server does not have is said so, not an error
+    let skill = inner
+        .tools
+        .skill_get(&json!({"skillId": "0123456789abcdef0123456789abcdef"}))
+        .await;
+    eprintln!("skill_get: {skill}");
+    assert!(skill.contains("no published skill"), "{skill}");
+
     // what the operator extracted is removed again with the rest
     for op in &added.operations {
         if let Some(id) = op["memory_id"].as_str() {
@@ -218,6 +264,55 @@ async fn live_memory_round_trip() {
         .expect("session end");
     eprintln!("session end: {ended}");
 
+    // ending is not final: the same session takes more turns afterwards, and is ended again
+    let more = inner
+        .client
+        .append_turns(json!({
+            "session_id": hs_session, "agent_id": agent, "project_id": "live", "conversation_id": session.session_id,
+            "turns": [
+                {"turn_index": 2, "role": "user", "content": "One more thing: I take no sugar.", "content_type": "text"},
+                {"turn_index": 3, "role": "assistant", "content": "No sugar, noted.", "content_type": "text"},
+            ],
+        }))
+        .await
+        .expect("turns after the session was ended");
+    eprintln!("turns after end: {more}");
+    let results = more["results"].as_array().expect("receipts");
+    assert!(
+        results
+            .iter()
+            .all(|r| matches!(r["sql_status"].as_str(), Some("stored" | "replayed"))),
+        "HeliconSearch takes turns after session/end: {more}"
+    );
+    // the receipt's content_hash is the sha256 of the text sent: that is what ties an extraction message to
+    // its archived turn (archive_ref), so it must agree with how the extension computes it
+    use sha2::{Digest, Sha256};
+    let sent = "One more thing: I take no sugar.";
+    let hash: String = Sha256::digest(sent.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        results[0]["content_hash"],
+        hash.as_str(),
+        "HeliconSearch hashes the text as sent: {more}"
+    );
+    let again = inner
+        .client
+        .session_end(
+            json!({"session_id": hs_session, "agent_id": agent, "project_id": "live",
+            "source_refs": [{"type": "session", "ref_id": hs_session}], "message_count": 4}),
+        )
+        .await
+        .expect("session end again");
+    eprintln!("session end again: {again}");
+    let page = inner
+        .client
+        .get_session_turns(&hs_session, &agent, "live", Some(0), None, Some(10))
+        .await
+        .expect("session turns");
+    assert_eq!(page["total"], 4, "{page}");
+
     // forgetting it
     let gone = inner
         .tools
@@ -225,4 +320,86 @@ async fn live_memory_round_trip() {
         .await;
     eprintln!("memory_forget: {gone}");
     assert_eq!(gone, format!("Memory {memory_id} forgotten."));
+}
+
+/// Read-only, against an agent that already has memories (set `HELICON_LIVE_READ_AGENT`, e.g. the
+/// tenant's default agent id): the cross-session summary and the recall are built from real data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a running HeliconSearch with memories: HELICON_LIVE_URL, HELICON_LIVE_TOKEN, HELICON_LIVE_READ_AGENT"]
+async fn live_the_bridge_and_recall_of_an_agent_with_real_memories() {
+    let (Ok(url), Ok(token), Ok(agent)) = (
+        std::env::var("HELICON_LIVE_URL"),
+        std::env::var("HELICON_LIVE_TOKEN"),
+        std::env::var("HELICON_LIVE_READ_AGENT"),
+    ) else {
+        panic!("set HELICON_LIVE_URL, HELICON_LIVE_TOKEN and HELICON_LIVE_READ_AGENT to run this live test");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(
+        MemoryConfig::parse(
+            &json!({"baseUrl": url, "apiKey": token, "agentId": agent, "debug": true}),
+            &|_| None,
+        )
+        .unwrap(),
+    );
+    let inner = Inner::new(cfg.clone(), dir.path());
+    let health = inner.client.health().await.expect("health");
+    inner.budgets.learn_from_health(Some(&health));
+    let bridge = inner
+        .client
+        .get_session_bridge(
+            &agent,
+            "",
+            &[("episodic_limit", "3".into())],
+            &super::client::CallOptions::default(),
+        )
+        .await
+        .expect("bridge");
+    let episodes = bridge["recent_episodes"].as_array().map_or(0, Vec::len);
+    let rendering = super::bridge::format_bridge_context(&bridge, cfg.session_bridge_token_budget);
+    eprintln!(
+        "bridge: protocol={} episodes={episodes}
+{}",
+        bridge["protocol"], rendering.text
+    );
+    assert_eq!(bridge["protocol"], "bridge.v2");
+    assert!(
+        !rendering.text.is_empty(),
+        "an agent with memories has a bridge"
+    );
+    if episodes > 0 {
+        assert!(
+            rendering.text.contains("**近期会话摘要**"),
+            "the episodes are shown"
+        );
+        assert!(rendering
+            .shown
+            .complete
+            .keys()
+            .any(|k| k.starts_with("session_summary:")));
+    }
+    // a first turn: the bridge and a recall, the recall not repeating what the bridge shows whole
+    let session = SessionInfo {
+        session_id: format!("live-read-{}", now_ms()),
+        agent: "lead".into(),
+    };
+    inner.session_created(&session);
+    let addendum = inner
+        .prepare_turn(&TurnContext {
+            session: &session,
+            submission_id: "sub-1",
+            text: "What do you remember about me and my preferences?",
+            addendum: None,
+        })
+        .await
+        .expect("an addendum");
+    eprintln!(
+        "addendum ({} bytes):
+{addendum}",
+        addendum.len()
+    );
+    assert!(addendum.contains("## 跨会话记忆"));
+    assert!(addendum.contains("<relevant-memories>"));
+    assert!(addendum.len() <= 32_000);
+    assert!(!addendum.contains('\0'));
 }

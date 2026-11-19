@@ -40,6 +40,10 @@
     "slug": "observability"
   },
   {
+    "source": "docs/harness/guides/helicon-memory-rust.md",
+    "slug": "helicon-memory-rust"
+  },
+  {
     "source": "docs/harness/guides/releases.md",
     "slug": "releases"
   },

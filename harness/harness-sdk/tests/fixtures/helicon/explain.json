@@ -1,0 +1,81 @@
+{
+  "code": 200,
+  "data": {
+    "memory": {
+      "access_count": 2,
+      "agent_id": "fixture-capture-1795083119",
+      "category": "preference",
+      "coherence_score": null,
+      "confidence": 1.0,
+      "confirm_count": 0,
+      "create_time": 1795083131,
+      "extraction_method": "operator",
+      "group_id": "openworker/fixture-capture-1795083119-s1/seg_0",
+      "id": "d443f666e9e245459fb03c91265e0071",
+      "importance": 0.85,
+      "last_accessed_at": "2026-11-19T10:12:13.840577",
+      "lifecycle_state": "active",
+      "memory_type": "semantic",
+      "metadata": {
+        "bucket": "PROFILE",
+        "derivation_level": "atomic",
+        "dimension": "H-PROFILE",
+        "evidence": [
+          {
+            "quote": "My favorite tea is jasmine green tea, and I take it without sugar.",
+            "session_datetime": "",
+            "session_id": "openworker/fixture-capture-1795083119-s1",
+            "speaker": "user",
+            "support_type": "explicit",
+            "turn_index": 0
+          }
+        ],
+        "evidence_quote_exact": true,
+        "evidence_quote_match_score": 1.0,
+        "generated_by": "local_llm",
+        "pass": "rewrite",
+        "source_gate": {
+          "decision": "authorized",
+          "kind": "user_direct",
+          "method": "exact",
+          "policy": "b1.5",
+          "score": 1.0,
+          "user_turn_index": 0
+        },
+        "subject": "user",
+        "support_type": "explicit",
+        "tags": [
+          "tea",
+          "preference",
+          "diet"
+        ]
+      },
+      "project_id": "fixtures",
+      "recall_count": 2,
+      "scope": "project",
+      "session_id": "openworker/fixture-capture-1795083119-s1",
+      "source_completeness": "full_session",
+      "source_refs": [
+        {
+          "ref_id": "openworker/fixture-capture-1795083119-s1",
+          "type": "session"
+        }
+      ],
+      "supersedes": null,
+      "text": "user's favorite tea is jasmine green tea without sugar.",
+      "topic_name": "seg:openworker/fixture-capture-1795083119-s1#0",
+      "unique_query_count": 1,
+      "update_time": 1795083131,
+      "useful_count": 0,
+      "useless_count": 0
+    },
+    "source_completeness": "full_session",
+    "source_refs": [
+      {
+        "ref_id": "openworker/fixture-capture-1795083119-s1",
+        "type": "session"
+      }
+    ],
+    "supersedes_chain": []
+  }
+}

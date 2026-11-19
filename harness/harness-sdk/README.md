@@ -86,6 +86,27 @@ For isolated shell/file execution, configure [OpenShell](../../docs/harness/guid
 Use `HarnessClient::managed_stdio` or the custom host interfaces only when you
 need an explicit process boundary; see the [native host guide](../partner/README.md).
 
+## Add long-term memory (optional)
+
+With a HeliconSearch server (a memory and retrieval service you run), your agents
+remember across sessions: what is relevant is recalled into each turn, conversations are archived and mined for facts,
+and the agent gets memory tools. It is switched on by one file, `helicon-memory.json`, in your state directory, and your
+code stays the same except that agents are registered with `harness.create_agent`:
+
+```json
+{ "baseUrl": "http://127.0.0.1:5001", "apiKey": "${HELICON_TENANT_TOKEN}", "agentId": "my-app" }
+```
+
+```sh
+cargo build -p openworker-sdk --bin openworker-harness       # agents with tools need the helper
+# tells a fact in one session and asks about it in the next:
+HELICON_TENANT_TOKEN=hs_... OPENAI_API_KEY=... OPENWORKER_MODEL=... \
+  cargo run -p openworker-sdk --example helicon_memory
+```
+
+No file, no change. See the [HeliconSearch memory guide](../../docs/harness/guides/helicon-memory-rust.md) for the token,
+options, what is sent where, and troubleshooting.
+
 ## Add the next capability
 
 | You want to… | Start here |
@@ -94,6 +115,7 @@ need an explicit process boundary; see the [native host guide](../partner/README
 | Handle streaming, approvals and cancellation | [Streaming](../../docs/harness/guides/streaming.md) · [Sessions](../../docs/harness/guides/sessions.md) |
 | Use local models or rotate credentials | [Models and credentials](../../docs/harness/guides/providers.md) |
 | Add teams, memory or scheduling | [Sessions and teams](../../docs/harness/guides/sessions.md) |
+| Remember across sessions with HeliconSearch | [HeliconSearch memory](../../docs/harness/guides/helicon-memory-rust.md) |
 | Add guardrails or inspect traces | [Guardrails](../../docs/harness/guides/guardrails.md) · [Observability](../../docs/harness/guides/observability.md) |
 | Deploy a service | [Deployment options](../../docs/harness/guides/deployment.md) |
 

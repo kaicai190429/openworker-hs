@@ -1,0 +1,197 @@
+{
+  "_legend": {
+    "array_order": "Within each section, earlier = higher trust/relevance in the only sense we can back (trace tier, then within-type score). There is NO comparable score across sections.",
+    "grounded_facts": "Derived facts whose evidence chain is traceable (a linked verbatim quote + session). Each carries evidence[] (the ground-truth quote) and corroborated_by (raw_context units that independently say the same thing).",
+    "how_to_use": "Answer from grounded_facts + their evidence quotes when the chain is solid; consult topic_rollups for coverage/counting; open raw_context to verify or when facts are missing; re-verify anything in needs_verification. Never treat a derived fact as truth over the raw evidence.",
+    "ids": "Every unit has a stable id. Cross-references (corroborated_by / shared_evidence_with / aggregates / possible_support) use these ids so you can trace any chain.",
+    "needs_verification": "Derived assertions with a broken/absent evidence chain. DO NOT trust as-is. Follow possible_support into raw_context and re-reason before using.",
+    "raw_context": "Verbatim original conversation windows/turns, extraction-agnostic. THIS IS GROUND TRUTH. When a derived fact is thin or a needs_verification item is unproven, read here and reason directly. Grouped by session, ordered by turn.",
+    "read_as": "recall organized by EVIDENCE-CHAIN TRUST — NOT by whether your question is answered",
+    "sections_in_priority_order": [
+      "grounded_facts",
+      "topic_rollups",
+      "raw_context",
+      "needs_verification"
+    ],
+    "topic_rollups": "Write-time aggregates over many memories. Use for 'which / how many / list all' breadth questions. Prose digest — may embed importance numbers; not a quotable fact. aggregates shows which grounded_facts it rolls up; backing_present=false means it asserts more than the facts returned here.",
+    "trust_model": "grounded_facts and topic_rollups are DERIVED by an extraction model (the memory write path). They can be generalized, incomplete, or WRONG — they are NOT ground truth. The ONLY authoritative content is the verbatim raw_context and the evidence quotes. If a derived fact looks thin, ambiguous, or conflicts, DO NOT trust it as truth — re-reason from raw_context and cite the raw quote instead."
+  },
+  "code": 200,
+  "conflicts": [],
+  "execution": {
+    "active_budget_ms": 36000,
+    "auto_tier_budget_ms": 12000,
+    "config_fingerprint": "32b79fb45707",
+    "degraded_stages": [],
+    "effective_budget_ms": 12000.0,
+    "elapsed_ms": 2194.0,
+    "outcome": "complete",
+    "purpose": "auto",
+    "request_id": "98d9aff572b0",
+    "retrieval_mode": "hybrid",
+    "soft_overruns": [],
+    "strategy": "multi",
+    "tier": "standard"
+  },
+  "grounded_facts": [
+    {
+      "claim": "user's favorite tea is jasmine green tea without sugar.",
+      "corroborated_by": [
+        "pkg:df4cd34bf5c9"
+      ],
+      "derived": true,
+      "evidence": [
+        {
+          "quote": "My favorite tea is jasmine green tea, and I take it without sugar.",
+          "source": "openworker/fixture-capture-1795083119-s1:turn0",
+          "speaker": "user"
+        }
+      ],
+      "id": "pkg:6c3bbcd54598",
+      "score": 0.9988518126878356,
+      "session_datetime": "2026-11-19T10:00:01.000Z",
+      "session_ids": [
+        "openworker/fixture-capture-1795083119-s1"
+      ],
+      "shared_evidence_with": [],
+      "source_memory_ids": [
+        "d443f666e9e245459fb03c91265e0071"
+      ],
+      "speaker": "user",
+      "support_level": "direct"
+    }
+  ],
+  "needs_verification": [],
+  "prompt_blocks": {
+    "blocks": [
+      {
+        "ref": {
+          "type": "legend"
+        },
+        "text": "MEMORY RECALL — organized by trust. FACTS are the derived, deduplicated claims to answer from; each may show an inline supporting quote (⤷ \"…\"). TOPIC_ROLLUPS aggregate them for 'which / how many / list all'. If a SESSION_SUMMARIES band is present, the facts were thin — use those condensed per-conversation summaries to fill gaps. For a single-answer question, answer from the most specific matching FACT. For a LIST / who-all / what-all / how-many question, gather EVERY matching item across ALL FACTS and TOPIC_ROLLUPS into one complete answer — do not stop at a single fact. Do not invent. A date in SQUARE BRACKETS — an [event: YYYY-MM-DD] tag, or inline right after a relative word (e.g. 'tomorrow [2023-07-28]', 'a year ago [2022]') — is the already-resolved ABSOLUTE date of the event; for a 'when' question answer with it, never the relative word. A trailing '— <date>' with no bracket is only the CONVERSATION date (when it was said), which may differ from when the event actually happened."
+      },
+      {
+        "ref": {
+          "section": "FACTS",
+          "type": "header"
+        },
+        "text": "\n\n## FACTS  (derived claims — answer from these)"
+      },
+      {
+        "ref": {
+          "extras": [
+            "time",
+            "quote"
+          ],
+          "memory_id": "d443f666e9e245459fb03c91265e0071",
+          "type": "memory",
+          "unverified": false,
+          "version": "d6e3b3fd42a02532"
+        },
+        "text": "\n• user's favorite tea is jasmine green tea without sugar.  — 2026-11-19T10:00:01.000Z\n    ⤷ \"My favorite tea is jasmine green tea, and I take it without sugar.\" — user"
+      }
+    ],
+    "protocol": "blocks.v1"
+  },
+  "prompt_text": "MEMORY RECALL — organized by trust. FACTS are the derived, deduplicated claims to answer from; each may show an inline supporting quote (⤷ \"…\"). TOPIC_ROLLUPS aggregate them for 'which / how many / list all'. If a SESSION_SUMMARIES band is present, the facts were thin — use those condensed per-conversation summaries to fill gaps. For a single-answer question, answer from the most specific matching FACT. For a LIST / who-all / what-all / how-many question, gather EVERY matching item across ALL FACTS and TOPIC_ROLLUPS into one complete answer — do not stop at a single fact. Do not invent. A date in SQUARE BRACKETS — an [event: YYYY-MM-DD] tag, or inline right after a relative word (e.g. 'tomorrow [2023-07-28]', 'a year ago [2022]') — is the already-resolved ABSOLUTE date of the event; for a 'when' question answer with it, never the relative word. A trailing '— <date>' with no bracket is only the CONVERSATION date (when it was said), which may differ from when the event actually happened.\n\n## FACTS  (derived claims — answer from these)\n• user's favorite tea is jasmine green tea without sugar.  — 2026-11-19T10:00:01.000Z\n    ⤷ \"My favorite tea is jasmine green tea, and I take it without sugar.\" — user",
+  "prompt_text_json": {
+    "facts": [
+      {
+        "claim": "user's favorite tea is jasmine green tea without sugar.  — 2026-11-19T10:00:01.000Z",
+        "claim_base": "user's favorite tea is jasmine green tea without sugar.",
+        "derived": true,
+        "evidence": [
+          {
+            "quote": "My favorite tea is jasmine green tea, and I take it without sugar.",
+            "speaker": "user"
+          }
+        ],
+        "id": "pkg:6c3bbcd54598",
+        "score": 0.9988518126878356,
+        "session_ids": [
+          "openworker/fixture-capture-1795083119-s1"
+        ],
+        "source_memory_ids": [
+          "d443f666e9e245459fb03c91265e0071"
+        ],
+        "speaker": "user",
+        "support_level": "direct",
+        "time_ref": null,
+        "time_suffix": "— 2026-11-19T10:00:01.000Z",
+        "unverified": false
+      }
+    ],
+    "topic_rollups": []
+  },
+  "raw_context": [
+    {
+      "session_datetime": "2026-11-19T10:00:00.000Z",
+      "session_id": "openworker/fixture-capture-1795083119-s1",
+      "turns": [
+        {
+          "id": "pkg:df4cd34bf5c9",
+          "is_orphan": false,
+          "kind": "raw_session_turn",
+          "score": 0.5,
+          "speaker": "user",
+          "text": "user: \"My favorite tea is jasmine green tea, and I take it without sugar.\"",
+          "turn": 0,
+          "turn_count": null
+        },
+        {
+          "id": "pkg:dee7a831ca33",
+          "is_orphan": false,
+          "kind": "raw_session_turn",
+          "score": 0.5,
+          "speaker": "assistant",
+          "text": "assistant: \"Noted: jasmine green tea, no sugar.\"",
+          "turn": 1,
+          "turn_count": null
+        }
+      ]
+    }
+  ],
+  "recall_layers": {
+    "category_count": 0,
+    "contract": {
+      "coverage_status": "grounded",
+      "grounded_count": 3,
+      "missing_slots": [],
+      "reason": "trace_complete",
+      "trace_sufficient": true
+    },
+    "effective_max_rounds": 1,
+    "effective_top_k": 12,
+    "evidence_span_count": 0,
+    "fallback_reason": "multi_source",
+    "fallback_triggered": true,
+    "memory_count": 1,
+    "raw_window_count": 0,
+    "recall_gate": {
+      "elapsed_ms": 2135.0,
+      "llm_ok": true,
+      "scenario": "profile",
+      "verdict": "recall",
+      "why": "Need user's tea preferences"
+    },
+    "reranked": false,
+    "retrieval_sources": {
+      "categories": 0,
+      "evidence_fts": 0,
+      "evidence_vector": 0,
+      "exact_phrases": 0,
+      "memories": 1,
+      "raw_turns": 2,
+      "raw_windows": 0,
+      "total": 3,
+      "trace_neighbors": 0,
+      "trace_spans": 0
+    },
+    "rounds_used": 1,
+    "skill_count": 0,
+    "stop_reason": "max_rounds_reached",
+    "trace_span_count": 0
+  },
+  "related_skills": [],
+  "topic_rollups": []
+}
