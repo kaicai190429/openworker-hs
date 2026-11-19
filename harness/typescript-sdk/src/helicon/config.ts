@@ -365,6 +365,11 @@ export const memoryConfigSchema = {
     }
     const baseUrl = normalizeBaseUrl(cfg.baseUrl);
 
+    for (const key of ["agentId", "projectId"] as const) {
+      if (cfg[key] !== undefined && cfg[key] !== null && typeof cfg[key] !== "string") {
+        throw new Error(`${key} must be a string`);
+      }
+    }
     const agentId =
       typeof cfg.agentId === "string" && cfg.agentId.trim()
         ? resolveEnvVars(cfg.agentId).trim()

@@ -1061,10 +1061,17 @@ export class Session {
     return memory.prepareTurn({ sessionId: this.id, text: messageText(input), submissionId, userAddendum: addendum, images: imageAttachments(input) });
   }
   async close(): Promise<void> {
-    await adapterOf(this.harness)?.onSessionClose(this.id);
-    checkMemberErrors(
-      await this.harness.request("agent/close", { session_id: this.id }),
-    );
+    const memory = adapterOf(this.harness);
+    await memory?.onSessionClose(this.id);
+    try {
+      checkMemberErrors(
+        await this.harness.request("agent/close", { session_id: this.id }),
+      );
+    } catch (err) {
+      // the engine refused (a turn is still running, say): the session is open, and memory follows it again
+      memory?.onSessionCloseFailed(this.id, this.agent);
+      throw err;
+    }
   }
 }
 

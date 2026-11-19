@@ -179,6 +179,8 @@ export class CaptureEngine {
     const from = Math.min(rec.archiveNext, extractFrom);
     const page = await readHistory(this.d.request, sessionId, from);
     if (page.next <= from) return true;
+    // a history longer than one read covers: the rest is looked at by the next cycle
+    if (page.more) l.dirty = true;
 
     const messages = toMessages(page, { ownToolPrefix: this.d.ownToolPrefix, ownCallIds: l.ownCallIds, now: Date.now() });
     const hsId = toHeliconSessionId(sessionId);
@@ -201,11 +203,15 @@ export class CaptureEngine {
         if (!Array.isArray(r.results)) {
           throw new Error(`session/turn answered without per-entry receipts session=${hsId}`);
         }
-        let retryFrom: number | undefined;
+        // what the server took (stored, replayed, or kept under a conflict): a turn it gave no receipt for, or an
+        // unusable one, was not archived and is sent again
+        const taken = new Set<number>();
         for (const e of r.results) {
           if ((e.sql_status === "stored" || e.sql_status === "replayed") && e.turn_id && e.content_hash) {
+            taken.add(e.turn_index);
             l.refs.set(e.turn_index, { turn_id: e.turn_id, content_hash: e.content_hash });
           } else if (e.sql_status === "revision_conflict") {
+            taken.add(e.turn_index);
             l.refs.delete(e.turn_index);
             const incoming = e.incoming_hash ?? "";
             if (l.conflicts.get(e.turn_index) !== incoming) {
@@ -215,11 +221,10 @@ export class CaptureEngine {
                 `${String(e.content_hash).slice(0, 8)}, sent ${incoming.slice(0, 8)}); kept as unresolved session=${hsId}`,
               );
             }
-          } else {
-            retryFrom = retryFrom === undefined ? e.turn_index : Math.min(retryFrom, e.turn_index);
           }
         }
-        rec.archiveNext = retryFrom ?? page.next;
+        const missing = turns.map((t) => t.turn_index).filter((i) => !taken.has(i));
+        rec.archiveNext = missing.length > 0 ? Math.min(...missing) : page.next;
         store.save(sessionId);
         logger.info(
           `[${PLUGIN_ID}] archived turns=${turns.length} from=${from} next=${rec.archiveNext} ` +
@@ -236,7 +241,7 @@ export class CaptureEngine {
       const slice = messages.slice(0, upto);
       l.extraction = l.extraction.then(() => this.extract(sessionId, l, slice, startIndex, upto));
     }
-    return upto >= page.next;
+    return upto >= page.next && !page.more;
   }
 
   private async extract(sessionId: string, l: Live, messages: unknown[], startIndex: number, upto: number): Promise<void> {

@@ -45,6 +45,20 @@ const SHUTDOWN_BUDGET_MS = 45_000;
 const ORPHANS_PER_START = 10;
 /** A turn in flight keeps its session from being called idle for this long at most (a turn whose end was never seen must not keep a session open for ever). */
 const RUNNING_CAP_MS = 6 * 3_600_000;
+/**
+ * What a tool hands the model at most (characters): a page of a long conversation, or a skill, can be far larger
+ * than is useful, and it would all be paid for in the context of every later step.
+ */
+const MAX_TOOL_OUTPUT_CHARS = 60_000;
+
+function capText(out: unknown): unknown {
+  if (typeof out !== "string" || out.length <= MAX_TOOL_OUTPUT_CHARS) return out;
+  let cut = out.slice(0, MAX_TOOL_OUTPUT_CHARS);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1); // not in the middle of a surrogate pair
+  return `${cut}\n(cut here: the answer was ${out.length} characters, more than the ${MAX_TOOL_OUTPUT_CHARS} a tool result is given. Ask for less: a narrower query, a smaller window, or the next page.)`;
+}
+
 /** The journal events that end a turn, however it ended. */
 const TURN_ENDED = new Set(["turn_completed", "turn_failed", "turn_cancelled", "turn_recovered"]);
 /** Attached images are deleted after this long. */
@@ -252,7 +266,7 @@ export class HeliconAdapter {
         execute: async (args, ctx) => {
           const tool = factory({ sessionKey: `${ctx.sessionId}#${ctx.turnId}`, sessionId: ctx.sessionId });
           const result = await tool.execute(ctx.callId, args);
-          const out = (result.data ?? result.content.map((c) => c.text).join("\n")) as never;
+          const out = capText(result.data ?? result.content.map((c) => c.text).join("\n")) as never;
           return result.image ? new ToolImageResult(out, { mimeType: result.image.mimeType, base64: result.image.base64 }) : out;
         },
       };
@@ -512,14 +526,17 @@ export class HeliconAdapter {
     if (running) return running;
     const work = (async () => {
       try {
-        const rec = this.store.get(sessionId);
-        if (rec.ended) return;
+        const first = this.store.get(sessionId);
+        if (first.ended) return;
+        const activity = first.lastActive;
         if (!(await this.capture.flush(sessionId, waitForExtractionMs))) {
           this.logger.warn(`[${PLUGIN_ID}] session ${sessionId} is not ended on HeliconSearch yet: its history is not fully archived`);
           return;
         }
-        if (rec.archiveNext === 0) {
-          rec.ended = true; // nothing was ever said: there is no HeliconSearch session to end
+        const archived = this.store.get(sessionId).archiveNext;
+        if (archived === 0) {
+          // nothing was ever said: there is no HeliconSearch session to end
+          this.store.get(sessionId).ended = true;
           this.store.save(sessionId);
           return;
         }
@@ -529,10 +546,16 @@ export class HeliconAdapter {
           agent_id: this.cfg.agentId,
           project_id: this.cfg.projectId,
           source_refs: [{ type: "session", ref_id: hsId }],
-          message_count: rec.archiveNext,
+          message_count: archived,
         });
-        rec.ended = true;
-        this.store.save(sessionId);
+        const rec = this.store.get(sessionId);
+        if (rec.lastActive > activity) {
+          // a turn that came in while this went on has the session in use again: it is not over
+          this.logger.info(`[${PLUGIN_ID}] session ${sessionId} was used again while it was being ended; it stays open`);
+        } else {
+          rec.ended = true;
+          this.store.save(sessionId);
+        }
         this.logger.info(`[${PLUGIN_ID}] session end status=${r.status} memory_id=${r.memory_id ?? "none"} session=${hsId}`);
         // (the server also summarises on its own; summaryOnSessionEnd off leaves it at that)
         if (r.status === "closed" && !r.memory_id && this.cfg.summaryOnSessionEnd) {
@@ -577,6 +600,15 @@ export class HeliconAdapter {
     this.savedAt.delete(sessionId);
   }
 
+  /** `session.close()` failed after `onSessionClose` let go of the session (the engine refused it, say because a turn is still running): it is open still, so it is followed again. */
+  onSessionCloseFailed(sessionId: string, agent?: string): void {
+    if (!this.allows(agent)) {
+      this.excluded.add(sessionId);
+      return;
+    }
+    this.touch(sessionId);
+  }
+
   /** Ends the sessions nobody has touched for `idleEndMs`. */
   private sweepIdle(): void {
     const limit = this.cfg.idleEndMs;
@@ -597,11 +629,12 @@ export class HeliconAdapter {
   private async endOrphans(): Promise<void> {
     const limit = this.cfg.idleEndMs;
     if (!this.cfg.syncTranscript || limit <= 0) return;
-    const live = new Set(this.knownSessions());
     let ended = 0;
     for (const id of this.store.list()) {
       if (ended >= ORPHANS_PER_START) break;
-      if (live.has(id)) continue;
+      // (looked at now, not when the start began: the application may have resumed it since, and a session in
+      // use is not an orphan)
+      if (this.known.has(id)) continue;
       const rec = this.store.get(id);
       if (rec.ended || rec.archiveNext === 0) {
         this.store.forget(id);
@@ -614,7 +647,7 @@ export class HeliconAdapter {
       }
       ended++;
       await this.endSession(id, 0);
-      this.capture.release(id);
+      if (!this.known.has(id)) this.capture.release(id); // (not one the application took up in the meantime)
     }
   }
 

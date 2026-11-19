@@ -455,6 +455,11 @@ export class HeliconApiError extends Error {
   }
 }
 
+/** HeliconSearch says "not found" as HTTP 404, and also in the body (`{"code": 404, ...}` under a 200). */
+export function isNotFound(err: unknown): boolean {
+  return err instanceof HeliconApiError && (err.status === 404 || err.retcode === 404);
+}
+
 /**
  * A call that got no HTTP answer to read: its own deadline passed (`deadline`, before the body was
  * read through, too), the caller's signal aborted it (`aborted`), the connection failed
@@ -1219,6 +1224,7 @@ export function createHeliconClient(opts: {
             logFailure(params.method, params.path, response.status, msg);
             throw new HeliconApiError({
               status: response.status,
+              retcode: code,
               retmsg: msg,
               body: wrap,
               message: `helicon-memory ${params.method} ${params.path} failed: code=${code} ${msg}`,
@@ -1353,7 +1359,16 @@ export function createHeliconClient(opts: {
         });
       }
 
-      const code = typeof raw?.code === "number" ? raw.code : 200;
+      // (every answer of the server's carries one: `{}`, `[]` or a string is not an acceptance, and the slice must
+      // not be taken for extracted and never sent again)
+      if (!raw || typeof raw !== "object" || typeof raw.code !== "number") {
+        throw new HeliconApiError({
+          status: response.status,
+          body: raw,
+          message: `helicon-memory POST ${path}: the answer has no status code, so it is not known to have been accepted`,
+        });
+      }
+      const code = raw.code;
       const numbers = (v: unknown): number[] =>
         Array.isArray(v) ? (v as unknown[]).filter((x): x is number => typeof x === "number") : [];
       // Messages the server left out of what it did — on every answer, the 202 too: what a work
@@ -1471,7 +1486,7 @@ export function createHeliconClient(opts: {
           ...(opts?.signal ? { signal: opts.signal } : {}),
         });
       } catch (err) {
-        if (err instanceof HeliconApiError && err.status === 404) {
+        if (isNotFound(err)) {
           return null;
         }
         throw err;
@@ -1489,7 +1504,7 @@ export function createHeliconClient(opts: {
         });
         return { content: data?.content ?? "" };
       } catch (err) {
-        if (err instanceof HeliconApiError && err.status === 404) {
+        if (isNotFound(err)) {
           return null;
         }
         throw err;
@@ -1544,7 +1559,7 @@ export function createHeliconClient(opts: {
       } catch (err) {
         // 404 = 该 id 不存在（已删除/被 supersede/id 无效），是正常业务分支而非故障：
         // 收敛成 null，让调用方给出可操作提示，而不是把一句 HTTP 404 甩给模型。
-        if (err instanceof HeliconApiError && err.status === 404) {
+        if (isNotFound(err)) {
           return null;
         }
         throw err;

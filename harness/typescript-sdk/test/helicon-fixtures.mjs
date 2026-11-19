@@ -31,7 +31,12 @@ export async function startFakeHelicon(behaviour = {}) {
       }
       if (p === "/v1/memory/session/turn") {
         if (behaviour.failTurns) return json(res, 503, { code: 503, message: "down" });
-        const results = body.turns.map((t) => ({ turn_index: t.turn_index, role: t.role, sql_status: "stored", turn_id: `turn${t.turn_index}`, content_hash: createHash("sha256").update(t.content, "utf8").digest("hex"), raw_status: "ready" }));
+        let results = body.turns.map((t) => ({ turn_index: t.turn_index, role: t.role, sql_status: "stored", turn_id: `turn${t.turn_index}`, content_hash: createHash("sha256").update(t.content, "utf8").digest("hex"), raw_status: "ready" }));
+        // behaviour.dropReceipts: the next that many answers carry a receipt for the first turn only
+        if ((behaviour.dropReceipts ?? 0) > 0) {
+          behaviour.dropReceipts -= 1;
+          results = results.slice(0, 1);
+        }
         sessions.get(body.session_id)?.push(...body.turns);
         return json(res, 200, { code: 200, data: { archived: results.length, conflicts: 0, errors: 0, partial: false, raw_repair_pending: 0, results } });
       }

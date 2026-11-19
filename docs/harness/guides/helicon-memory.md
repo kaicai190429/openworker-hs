@@ -84,7 +84,7 @@ with `--env HELICON_TENANT_TOKEN` and supply the variable to the application.
 | --- | --- | --- |
 | `baseUrl` | required | HeliconSearch address. |
 | `apiKey` | required | Tenant token: the token itself, or `"${HELICON_TENANT_TOKEN}"`. |
-| `agentId` / `projectId` | `openworker` / `""` | Where memories are written and read. |
+| `agentId` / `projectId` | `openworker` / `""` | Where memories are written and read (strings: anything else is refused). |
 | `autoRecall` | `true` | Recall into every turn. |
 | `autoCapture` | `true` | Archive and extract after every turn. Off: nothing of the conversation is sent, not even when a session is closed or the harness shut down. |
 | `captureMode` | `operator` | `operator`: HeliconSearch's model extracts, merges and updates facts from the whole conversation. `direct`: no model; user sentences that match a few keyword rules are stored as they are (at most 3 a turn), and HeliconSearch still extracts the archived conversation when the session ends, so facts can be stored twice. Use `direct` only when HeliconSearch has no extraction model. |
@@ -132,13 +132,20 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
 - **Tool calls are approvals.** The memory and media tools are ordinary application tools, so the agent's
   approval mode applies: with the default `always`, the user is asked before the agent searches, uploads or
   forgets. Recall and capture are not tool calls and need no approval.
+- **Forgetting is two steps.** `memory_forget` with a `query` only lists the candidate memories; the agent deletes one
+  by calling it again with that memory's `memoryId`. A search score says how well a memory matched, not that it is
+  the one meant, and a deletion cannot be undone.
+- **Tool results are cut at 60,000 characters** (a long conversation page, say), with a note saying so.
 - **Agent definitions change.** When memory is on, the SDK adds the tool names and a short usage note to each
   agent's `tools` and `instructions` at registration. Agent definitions are immutable per name, so turning
   memory on or off for an existing agent needs a new agent name.
 - **Existing sessions are back-filled.** A session that predates the configuration is archived from its first
   message the next time it has a turn.
-- **A session whose history could not be archived (HeliconSearch down) is not ended on HeliconSearch.** The next idle
-  sweep, close or shutdown tries again.
+- **A session whose history could not be archived (HeliconSearch down) is not ended on HeliconSearch.** While it is
+  open, the idle sweep (once it has been quiet for `idleEndMs`) and shutdown try again. One that was closed
+  meanwhile is tried again at the next start of the application, once it has been quiet for `idleEndMs`.
+- **A `close()` the engine refuses** (a turn is still running: cancel it first) leaves the session open, and it is
+  followed again, so that turn is archived.
 - **Ending is not final.** A session that was ended and then gets another turn (resumed later, or after an idle
   ending) is archived into the same HeliconSearch session and ended again when it goes quiet again.
 - **`close()` does not wait for HeliconSearch to finish.** It sends what is pending (the verbatim archive) and ends
@@ -177,6 +184,11 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
   tools or the usage note (their sessions are still recalled into and archived). Create agents with
   `harness.createAgent`.
 - Each turn waits for recall before it is sent, at most `hookTimeoutMs` (HeliconSearch normally answers in 1-2 s).
+- The memory tools are registered with the engine under fixed texts, and the engine keeps what it was given for a
+  tool name. An SDK upgrade that has to reword one of them cannot re-register it in a state directory that already
+  holds the old one: the adapter stays off and says so (`helicon-memory is off: ... definition changed`). No option
+  changes a tool's text, so changing options never causes this. (A state directory used with an earlier build of this
+  adapter, whose `memory_recall` text named `topK` and `autoRecall`, holds the old text: use a fresh state directory.)
 
 - TypeScript SDK with the managed engine process only. A `Harness.connect()` service client does not get it. A Rust
   application uses the Rust SDK's own memory extension (`helicon-memory-rust.md`), which reads the same

@@ -141,17 +141,15 @@ export function registerTools(params: {
     (toolCtx) => ({
       name: "memory_recall",
       label: "Memory Recall (HeliconSearch)",
+      // (The text of a tool must not depend on the configuration: the engine keeps the descriptor of a tool name
+      // and refuses a changed one, which would switch the memory off at the next start.)
       description:
-        "Search long-term memory. " +
-        (cfg.autoRecall
-          ? "Memories relevant to the user's message are already looked up and shown in <relevant-memories>; use this for what they do not cover. "
-          : "") +
-        "One search per user message: make the query cover what is missing.",
+        "Search long-term memory. Memories relevant to the user's message may already be shown in <relevant-memories>; use this for what they do not cover. One search per user message: make the query cover what is missing.",
       parameters: Type.Object({
         query: Type.String({ description: "Search query (natural language)" }),
         limit: Type.Optional(
           Type.Number({
-            description: `Max results to return (1-20, default ${cfg.topK})`,
+            description: "Max results to return (1-20; a default is used when omitted)",
           }),
         ),
       }),
@@ -424,7 +422,7 @@ export function registerTools(params: {
       name: "memory_forget",
       label: "Memory Forget (HeliconSearch)",
       description:
-        "Delete a memory from HeliconSearch by id, or by query when the id is unknown. When using `query`, only auto-deletes when there is a unique high-score match; otherwise returns the candidates so the agent can pick one and call again with `memoryId`.",
+        "Delete a memory from HeliconSearch by id. When the id is unknown, give `query` instead: that only lists the candidate memories (nothing is deleted); call again with the `memoryId` of the one to forget.",
       parameters: Type.Object({
         memoryId: Type.Optional(
           Type.String({
@@ -507,26 +505,8 @@ export function registerTools(params: {
               details: { action: "no_candidates" },
             };
           }
-          // Auto-delete when there is a single strong match with a source memory id
-          const target = filtered[0];
-          if (filtered.length === 1 && target && target.score > 0.5) {
-            const memId = target.memoryId;
-            const ok = await client.delete(memId);
-            api.logger.info(
-              `[${PLUGIN_ID}] tool=memory_forget → auto-deleted id=${memId} score=${target.score} ok=${ok}`,
-            );
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: ok
-                    ? `Forgotten: "${target.text}" (id=${memId})`
-                    : `Could not forget "${target.text}" (id=${memId}): the server did not delete it.`,
-                },
-              ],
-              details: { action: ok ? "deleted" : "not_deleted", id: memId, ok },
-            };
-          }
+          // A search never deletes: a score says how well a memory matched the words, not that it is the one
+          // meant, and a deletion cannot be undone. The agent picks one and calls again with its id.
           const list = filtered
             .map(
               (it) => `- [${it.memoryId}] ${it.text.slice(0, 60)} (${(it.score * 100).toFixed(0)}%)`,
@@ -539,7 +519,7 @@ export function registerTools(params: {
             content: [
               {
                 type: "text",
-                text: `Found ${filtered.length} candidates. Specify memoryId:\n${list}`,
+                text: `Found ${filtered.length} candidate${filtered.length === 1 ? "" : "s"}. Nothing was deleted: call memory_forget again with the memoryId of the one to forget:\n${list}`,
               },
             ],
             details: {

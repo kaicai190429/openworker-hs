@@ -144,7 +144,7 @@ export function registerMediaTools(params: {
       additionalProperties: false,
       properties: {
         query: { type: "string", description: "What the image or video shows, in the user's own words." },
-        max_results: { type: "number", description: `Most results to return (default ${cfg.mediaMaxResults}).` },
+        max_results: { type: "number", description: "Most results to return (a default is used when omitted)." },
         labels: { type: "array", items: { type: "string" }, description: 'Media types to search: "image", "video" (default both).' },
         lowest_similarity: { type: "number", description: "Minimum similarity 0-1; weak matches below it are dropped." },
       },
@@ -247,7 +247,7 @@ export function registerMediaTools(params: {
       properties: {
         ref_image: { type: "string", description: "Absolute path of the reference image. One of ref_image or doc_id is required." },
         doc_id: { type: "string", description: "doc_id of an earlier result." },
-        max_results: { type: "number", description: `Most results to return (default ${cfg.mediaMaxResults}).` },
+        max_results: { type: "number", description: "Most results to return (a default is used when omitted)." },
         lowest_similarity: { type: "number", description: "Minimum similarity 0-1." },
       },
     },

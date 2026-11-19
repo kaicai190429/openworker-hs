@@ -143,7 +143,7 @@ test("session records survive a restart", async () => {
 
 // ── the adapter, with a fake harness and a fake HeliconSearch ───────────────────
 
-function fakeHarness(historyBySession) {
+function fakeHarness(historyBySession, perRead) {
   const hints = new Set();
   const registered = [];
   return {
@@ -152,8 +152,10 @@ function fakeHarness(historyBySession) {
     async request(method, params) {
       if (method === "history/read") {
         const all = historyBySession.get(params.session_id) ?? [];
-        const items = all.filter((x) => x.index >= params.after);
-        return { items, cursor: all.length, has_more: false, total_items: all.length };
+        const wanted = all.filter((x) => x.index >= params.after);
+        const items = perRead ? wanted.slice(0, perRead) : wanted;
+        const cursor = perRead ? (items.at(-1)?.index ?? params.after - 1) + 1 : all.length;
+        return { items, cursor, has_more: items.length < wanted.length, total_items: all.length };
       }
       throw new Error(`unexpected ${method}`);
     },
@@ -169,11 +171,11 @@ function emitDone(t, sid) {
   t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
 }
 
-async function attach(behaviour = {}, extra = {}) {
+async function attach(behaviour = {}, extra = {}, perRead = undefined) {
   const hs = await startFakeHelicon(behaviour);
   const dir = await stateWith({ baseUrl: hs.url, apiKey: "hs_test", agentId: "tester", captureMode: "operator", closeWaitMs: 0, debug: true, ...extra });
   const history = new Map();
-  const harness = fakeHarness(history);
+  const harness = fakeHarness(history, perRead);
   const adapter = await HeliconAdapter.attach(harness, dir);
   assert.ok(adapter, "adapter attaches");
   return { hs, dir, history, harness, adapter, done: async () => { await adapter.shutdown(); await hs.close(); } };
@@ -903,4 +905,102 @@ test("an absurd recall budget from the server is clamped", async () => {
   assert.equal(budgets.current().autoMs, 600_000);
   assert.equal(budgets.current().activeMs, 600_000);
   assert.ok(Number.isFinite(budgets.activeDeadlineMs()) && budgets.activeDeadlineMs() - Date.now() < 700_000);
+});
+
+test("the text of the memory tools does not depend on the options (the engine keeps a tool's descriptor)", async () => {
+  const plain = await attach();
+  const other = await attach({}, { autoRecall: false, topK: 3, mediaMaxResults: 2 });
+  try {
+    const a = plain.harness.registered[0].tools;
+    const b = other.harness.registered[0].tools;
+    assert.deepEqual(Object.keys(a).sort(), Object.keys(b).sort());
+    for (const name of Object.keys(a)) {
+      assert.equal(JSON.stringify([a[name].description, a[name].inputSchema]), JSON.stringify([b[name].description, b[name].inputSchema]), name);
+    }
+  } finally { await plain.done(); await other.done(); }
+});
+
+test("memory_forget with a query only lists the candidates, however strong the match", async () => {
+  const t = await attach();
+  try {
+    const forget = t.harness.registered[0].tools.memory_forget;
+    const text = await forget.execute({ query: "what do I like" }, toolCtx("s_forget"));
+    assert.match(String(text), /Found 1 candidate\. Nothing was deleted/);
+    assert.match(String(text), /user likes teal/);
+    assert.equal(t.hs.calls.some((c) => c.method === "DELETE"), false, "a search must not delete");
+  } finally { await t.done(); }
+});
+
+test("a history longer than one read is archived to its end before the session counts as caught up", async () => {
+  const t = await attach({}, {}, 1); // a history/read covers one item
+  try {
+    const items = [];
+    for (let i = 0; i < 205; i++) {
+      items.push(i % 2 === 0
+        ? { index: i, item: { role: "user", content: `I like thing number ${i}` } }
+        : { index: i, item: { role: "assistant", type: "message", content: [{ type: "output_text", text: "ok" }] } });
+    }
+    t.history.set("s_long", items);
+    t.adapter.onSessionCreated("s_long", "a");
+    assert.equal(await t.adapter.capture.flush("s_long", 0), true);
+    const archived = turnCalls(t.hs).reduce((n, c) => n + c.body.turns.length, 0);
+    assert.equal(archived, 205, "the 5 items beyond the first 200 pages are archived too");
+    assert.equal(new SessionStore(join(t.dir, "helicon-memory")).get("s_long").archiveNext, 205);
+  } finally { await t.done(); }
+});
+
+test("a turn the server gave no receipt for is sent again", async () => {
+  const t = await attach({ dropReceipts: 1 }, { sessionBridge: false });
+  try {
+    say(t.history, "s_rc", "I prefer dark mode");
+    t.adapter.onSessionCreated("s_rc", "a");
+    assert.equal(await t.adapter.capture.flush("s_rc", 0), false, "a turn is missing its receipt");
+    assert.equal(t.adapter.store.get("s_rc").archiveNext, 1);
+    assert.equal(await t.adapter.capture.flush("s_rc", 0), true);
+    assert.equal(t.adapter.store.get("s_rc").archiveNext, 2);
+    const calls = turnCalls(t.hs);
+    assert.deepEqual(calls.map((c) => c.body.turns.map((x) => x.turn_index)), [[0, 1], [1]], "only the turn without a receipt is sent again");
+  } finally { await t.done(); }
+});
+
+test("a close the engine refused leaves the session followed, and its last turn is archived", async () => {
+  const t = await attach({}, { sessionBridge: false });
+  try {
+    say(t.history, "s_cf", "I prefer dark mode");
+    t.adapter.onSessionCreated("s_cf", "a");
+    await t.adapter.onSessionClose("s_cf"); // the adapter lets go of it ...
+    assert.equal(turnCalls(t.hs).length, 1);
+    t.history.set("s_cf", [...t.history.get("s_cf"), { index: 2, item: { role: "user", content: "and I like tea" } }]);
+    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_cf" });
+    await wait(700);
+    assert.equal(turnCalls(t.hs).length, 1, "closed: its events are not followed");
+    // ... and the engine did not close it after all
+    t.adapter.onSessionCloseFailed("s_cf", "a");
+    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_cf" });
+    assert.ok(await until(() => turnCalls(t.hs).length >= 2), "followed again: the new turn is archived");
+  } finally { await t.done(); }
+});
+
+test("a session used again while its end is under way is not marked ended", async () => {
+  const t = await attach();
+  try {
+    say(t.history, "s_busy", "I prefer dark mode");
+    t.adapter.onSessionCreated("s_busy", "a");
+    // the end is slow to be answered
+    const real = t.adapter.client.sessionEnd.bind(t.adapter.client);
+    t.adapter.client.sessionEnd = async (req) => { await wait(400); return real(req); };
+    const ending = t.adapter.endSession("s_busy", 0);
+    await wait(100);
+    t.adapter.touch("s_busy"); // a turn comes in
+    await ending;
+    assert.equal(t.adapter.store.get("s_busy").ended, false, "it was used again, so it is not over");
+  } finally { await t.done(); }
+});
+
+test("an id that is not a string would be another partition: refused", async () => {
+  const dir = await stateWith({ baseUrl: "http://127.0.0.1:1", apiKey: "hs_test", agentId: 42 });
+  const loaded = loadHeliconConfig(dir, {});
+  assert.equal(loaded.status, "invalid");
+  assert.match(loaded.reason, /agentId must be a string/);
+  await rm(dir, { recursive: true, force: true });
 });

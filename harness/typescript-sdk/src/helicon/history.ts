@@ -17,7 +17,13 @@
 
 export type HistoryRequest = (method: string, params: unknown) => Promise<unknown>;
 export type HistoryItem = { index: number; item: Record<string, unknown> };
-export type HistoryPage = { items: HistoryItem[]; /** the next index to read from */ next: number };
+export type HistoryPage = {
+  items: HistoryItem[];
+  /** the next index to read from */
+  next: number;
+  /** the read stopped (a very long history) with more left: `next` is not the end of the history */
+  more: boolean;
+};
 
 const MAX_PAGES = 200;
 
@@ -29,6 +35,7 @@ function rec(v: unknown): Record<string, unknown> | undefined {
 export async function readHistory(request: HistoryRequest, sessionId: string, after: number): Promise<HistoryPage> {
   const items: HistoryItem[] = [];
   let cursor = Math.max(0, after);
+  let moreLeft = false;
   for (let page = 0; page < MAX_PAGES; page++) {
     const r = rec(await request("history/read", { session_id: sessionId, after: cursor }));
     if (!r) break;
@@ -40,9 +47,10 @@ export async function readHistory(request: HistoryRequest, sessionId: string, af
     const next = typeof r.cursor === "number" ? r.cursor : cursor;
     const more = r.has_more === true && next > cursor;
     cursor = next;
+    moreLeft = more;
     if (!more) break;
   }
-  return { items, next: cursor };
+  return { items, next: cursor, more: moreLeft };
 }
 
 export type AdaptContext = {
