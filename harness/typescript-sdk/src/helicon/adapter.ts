@@ -22,6 +22,7 @@ import type { MemoryConfig } from "./config.js";
 import { loadHeliconConfig } from "./config-file.js";
 import { MODEL_TOOL_PREFIX, memoryGuidance, TOOL_NAMESPACE } from "./guidance.js";
 import { createHeliconClient, type ClientLogger, type HeliconClient } from "./helicon-client.js";
+import { wrapRelevantMemoriesBlock } from "./filters.js";
 import { createFileLogger } from "./log.js";
 import { HeliconMediaClient } from "./media-client.js";
 import { registerMediaTools } from "./media-tools.js";
@@ -75,6 +76,21 @@ function cutBytes(text: string, maxBytes: number): string {
   const last = text.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end--;
   return text.slice(0, end);
+}
+
+/** What ends a cut addendum: its last `<relevant-memories>` envelope is kept closed. */
+const ENVELOPE_END = "\n</relevant-memories>";
+
+/**
+ * `text` (blocks that each end with `</relevant-memories>`) within `room` bytes. A cut keeps the last envelope
+ * closed, so what follows the addendum (the engine's own notes) is not read as part of it.
+ */
+function fitEnvelopes(text: string, room: number): string | undefined {
+  if (utf8Length(text) <= room) return text;
+  const keep = room - utf8Length(ENVELOPE_END);
+  if (keep <= 0) return undefined;
+  const cut = cutBytes(text, keep);
+  return cut.trim() ? `${cut}${ENVELOPE_END}` : undefined;
 }
 
 /** A Map that forgets its oldest entry past a size, for per-turn bookkeeping. */
@@ -315,10 +331,12 @@ export class HeliconAdapter {
         }
         this.recalled.set(key, ours);
       }
-      if (!ours) return userAddendum;
+      // the engine refuses a NUL in the addendum
+      ours = ours?.replaceAll("\0", "");
+      if (!ours?.trim()) return userAddendum;
       const own = userAddendum ?? "";
       const room = MAX_ADDENDUM_BYTES - utf8Length(own) - (own ? 2 : 0);
-      const fitted = cutBytes(ours, room);
+      const fitted = fitEnvelopes(ours, room);
       if (!fitted) return userAddendum;
       return own ? `${own}\n\n${fitted}` : fitted;
     } catch (err) {
@@ -360,7 +378,8 @@ export class HeliconAdapter {
       this.store.save(sessionId);
     }
     const parts: string[] = [];
-    if (bridge.state !== "omitted") parts.push(bridge.rendering.text);
+    // what the bridge says came from conversations: data, under the same notice as the recall, escaped
+    if (bridge.state !== "omitted") parts.push(wrapRelevantMemoriesBlock(bridge.rendering.text));
     if (recall.prependContext) parts.push(recall.prependContext);
     this.logger.info(
       `[${PLUGIN_ID}] turn session=${sessionId} recall=${recall.report.outcome} bridge=${bridge.state === "omitted" ? bridge.why : "injected"} ` +
@@ -466,7 +485,10 @@ export class HeliconAdapter {
       try {
         const rec = this.store.get(sessionId);
         if (rec.ended) return;
-        await this.capture.flush(sessionId, waitForExtractionMs);
+        if (!(await this.capture.flush(sessionId, waitForExtractionMs))) {
+          this.logger.warn(`[${PLUGIN_ID}] session ${sessionId} is not ended on HeliconSearch yet: its history is not fully archived`);
+          return;
+        }
         if (rec.archiveNext === 0) {
           rec.ended = true; // nothing was ever said: there is no HeliconSearch session to end
           this.store.save(sessionId);
@@ -513,6 +535,9 @@ export class HeliconAdapter {
     if (this.excluded.delete(sessionId)) return;
     if (this.cfg.syncTranscript) {
       await HeliconAdapter.within(this.endSession(sessionId, this.cfg.closeWaitMs), this.cfg.closeWaitMs + CLOSE_MARGIN_MS);
+    } else {
+      // (not ended on HeliconSearch, but the last turn is not left behind with the debounce timer)
+      await HeliconAdapter.within(this.capture.flush(sessionId, 0).catch(() => undefined), CLOSE_MARGIN_MS);
     }
     this.capture.release(sessionId);
     this.attached.delete(sessionId);

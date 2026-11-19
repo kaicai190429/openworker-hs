@@ -49,15 +49,17 @@ export async function startFakeHelicon(behaviour = {}) {
       if (p === "/v1/memory/session_bridge") {
         return json(res, 200, { code: 200, data: {
           protocol: "bridge.v2", is_empty: false, conflict_limit: 5, conflicts: [], procedures: [], category_summaries: [], recent_episodes: [],
-          pinned_semantics: [{ id: "b".repeat(32), text: "User prefers teal.", memory_type: "semantic", category: "preference", scope: "project", agent_id: "a", project_id: "", importance: 0.9, version: "v1" }],
+          pinned_semantics: [{ id: "b".repeat(32), text: behaviour.bridgeText ?? "User prefers teal.", memory_type: "semantic", category: "preference", scope: "project", agent_id: "a", project_id: "", importance: 0.9, version: "v1" }],
         } });
       }
       if (p === "/v1/memory/query") {
         const facts = behaviour.noRecall ? [] : [{ id: "pkg:abc", claim: "user likes teal", score: 0.9, support_level: "direct", source_memory_ids: [MEMORY_ID] }];
-        const text = facts.length ? "## FACTS\n• user likes teal\n" : "";
+        // behaviour.nulInRecall: a remembered text with a NUL in it (the engine refuses a NUL in the addendum)
+        const liked = behaviour.nulInRecall ? "user likes\u0000teal" : "user likes teal";
+        const text = facts.length ? `## FACTS\n• ${liked}\n` : "";
         return json(res, 200, { code: 200, grounded_facts: facts, topic_rollups: [], raw_context: [], needs_verification: [], conflicts: [], related_skills: [],
           prompt_text: text,
-          prompt_blocks: { protocol: "blocks.v1", blocks: facts.length ? [{ text: "## FACTS\n", ref: { type: "header" } }, { text: "• user likes teal\n", ref: { type: "memory", memory_id: MEMORY_ID, version: "v1", extras: [] } }] : [] },
+          prompt_blocks: { protocol: "blocks.v1", blocks: facts.length ? [{ text: "## FACTS\n", ref: { type: "header" } }, { text: `• ${liked}\n`, ref: { type: "memory", memory_id: MEMORY_ID, version: "v1", extras: [] } }] : [] },
         });
       }
       if (p === "/v1/memory/session/end") {

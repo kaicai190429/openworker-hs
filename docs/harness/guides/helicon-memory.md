@@ -66,7 +66,7 @@ with `--env HELICON_TENANT_TOKEN` and supply the variable to the application.
 | `apiKey` | required | Tenant token: the token itself, or `"${HELICON_TENANT_TOKEN}"`. |
 | `agentId` / `projectId` | `openworker` / `""` | Where memories are written and read. |
 | `autoRecall` | `true` | Recall into every turn. |
-| `autoCapture` | `true` | Archive and extract after every turn. |
+| `autoCapture` | `true` | Archive and extract after every turn. Off: nothing of the conversation is sent, not even when a session is closed or the harness shut down. |
 | `captureMode` | `operator` | `operator`: HeliconSearch's model extracts, merges and updates facts from the whole conversation. `direct`: no model; user sentences that match a few keyword rules are stored as they are (at most 3 a turn), and HeliconSearch still extracts the archived conversation when the session ends, so facts can be stored twice. Use `direct` only when HeliconSearch has no extraction model. |
 | `sessionBridge` | `true` | Add the cross-session summary to a new session's first turn. |
 | `hookTimeoutMs` | `15000` | The longest a turn waits for memory before it goes on without it. |
@@ -117,13 +117,16 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
   memory on or off for an existing agent needs a new agent name.
 - **Existing sessions are back-filled.** A session that predates the configuration is archived from its first
   message the next time it has a turn.
+- **A session whose history could not be archived (HeliconSearch down) is not ended on HeliconSearch.** The next idle
+  sweep, close or shutdown tries again.
 - **Ending is not final.** A session that was ended and then gets another turn (resumed later, or after an idle
   ending) is archived into the same HeliconSearch session and ended again when it goes quiet again.
 - **`close()` does not wait for HeliconSearch to finish.** It sends what is pending (the verbatim archive) and ends
   the session; HeliconSearch extracts facts and writes the summary on its own, usually within a minute, and
   longer when its queue is busy. Facts the running process was already extracting continue while it lives.
   Set `closeWaitMs` only for a short-lived script that wants its own extraction finished before it exits.
-- **Recalled memory is data, not instructions.** It is added with a notice saying so, and escaped.
+- **Recalled memory is data, not instructions.** Both the recall and the first-turn summary are added with a notice
+  saying so, and escaped.
 - **Everything said is sent to HeliconSearch** and stored there verbatim, with the facts extracted from it.
   Tool calls and their results are archived too, except the memory and media tools' own.
 

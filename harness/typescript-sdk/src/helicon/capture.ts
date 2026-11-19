@@ -38,6 +38,8 @@ type Live = {
   /** extraction in flight or done up to here (>= the saved extractNext); lowered when one fails */
   extractedTo: number | undefined;
   extraction: Promise<void>;
+  /** the last cycle left no history unarchived (and did not fail) */
+  caughtUp: boolean;
 };
 
 export type CaptureDeps = {
@@ -74,6 +76,7 @@ export class CaptureEngine {
         hsStarted: false,
         extractedTo: undefined,
         extraction: Promise.resolve(),
+        caughtUp: true,
       };
       this.live.set(sessionId, l);
     }
@@ -95,6 +98,8 @@ export class CaptureEngine {
 
   /** Runs cycles until nothing new is left; concurrent callers share the running one. */
   run(sessionId: string): Promise<void> {
+    // autoCapture off means nothing is archived or extracted, whoever asks (a flush at close or shutdown too)
+    if (!this.d.cfg.autoCapture) return Promise.resolve();
     const l = this.liveOf(sessionId);
     if (l.running) {
       l.dirty = true;
@@ -104,8 +109,9 @@ export class CaptureEngine {
       do {
         l.dirty = false;
         try {
-          await this.cycle(sessionId, l);
+          l.caughtUp = await this.cycle(sessionId, l);
         } catch (err) {
+          l.caughtUp = false;
           this.d.logger.warn(`[${PLUGIN_ID}] capture cycle failed session=${sessionId}: ${describe(err)}`);
         }
       } while (l.dirty);
@@ -115,8 +121,13 @@ export class CaptureEngine {
     return l.running;
   }
 
-  /** Archives everything pending now and waits (bounded) for the extraction of it. */
-  async flush(sessionId: string, waitForExtractionMs: number): Promise<void> {
+  /**
+   * Archives everything pending now and waits (bounded) for the extraction of it. True when the archive is
+   * up to date with the history; false when something could not be sent (HeliconSearch down, a turn refused):
+   * the session is then not over yet.
+   */
+  async flush(sessionId: string, waitForExtractionMs: number): Promise<boolean> {
+    if (!this.d.cfg.autoCapture) return true; // nothing is archived, so nothing is behind
     const l = this.liveOf(sessionId);
     if (l.timer) {
       clearTimeout(l.timer);
@@ -132,6 +143,7 @@ export class CaptureEngine {
         }),
       ]).finally(() => clearTimeout(timer));
     }
+    return l.caughtUp;
   }
 
   /** Every session this process has captured for (shutdown flushes them). */
@@ -159,13 +171,14 @@ export class CaptureEngine {
     await this.ensureStarted(sessionId, this.liveOf(sessionId));
   }
 
-  private async cycle(sessionId: string, l: Live): Promise<void> {
+  /** One look at the history: true when all of it is archived afterwards. */
+  private async cycle(sessionId: string, l: Live): Promise<boolean> {
     const { cfg, client, store, logger } = this.d;
     const rec = store.get(sessionId);
     const extractFrom = Math.max(rec.extractNext, l.extractedTo ?? 0);
     const from = Math.min(rec.archiveNext, extractFrom);
     const page = await readHistory(this.d.request, sessionId, from);
-    if (page.next <= from) return;
+    if (page.next <= from) return true;
 
     const messages = toMessages(page, { ownToolPrefix: this.d.ownToolPrefix, ownCallIds: l.ownCallIds, now: Date.now() });
     const hsId = toHeliconSessionId(sessionId);
@@ -223,6 +236,7 @@ export class CaptureEngine {
       const slice = messages.slice(0, upto);
       l.extraction = l.extraction.then(() => this.extract(sessionId, l, slice, startIndex, upto));
     }
+    return upto >= page.next;
   }
 
   private async extract(sessionId: string, l: Live, messages: unknown[], startIndex: number, upto: number): Promise<void> {
