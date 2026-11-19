@@ -91,7 +91,7 @@ with `--env HELICON_TENANT_TOKEN` and supply the variable to the application.
 | `sessionBridge` | `true` | Add the cross-session summary to a new session's first turn. |
 | `hookTimeoutMs` | `15000` | The longest a turn waits for memory before it goes on without it. |
 | `endOnShutdown` | `true` | `harness.shutdown()` ends the sessions this run worked on and did not close. |
-| `idleEndMs` | `1800000` | A session with no turn for this long (ms) is ended; a session an earlier run left open is ended at the next start. `0`: never. |
+| `idleEndMs` | `1800000` | A session with no turn for this long (ms) is ended; a session an earlier run left open is ended at the next start (or once it has been quiet that long). A session with a turn in flight is never idle. `0`: never. |
 | `agents` | all | Names of the agents that get memory. Every other agent of the harness is left alone: its sessions are neither recalled into nor archived. |
 | `closeWaitMs` | `0` | How long `close()` waits for this process's own fact extraction (`0`: not at all; see below). |
 | `replaceBuiltinMemory` | `true` | Agents get the Helicon tools instead of the engine's built-in `memory_*` tools. |

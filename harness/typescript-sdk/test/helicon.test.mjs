@@ -823,3 +823,19 @@ test("a session a run left open moments ago is ended by the idle sweep once it h
     assert.ok(await until(() => sessionEnds(hs).includes("openworker/s_moments"), 8000), "the sweep ends it later");
   } finally { await adapter.shutdown(); await hs.close(); }
 });
+
+test("a session with a turn in flight is not idle however quiet it is", async () => {
+  const t = await attach({}, { idleEndMs: 1_000, autoRecall: false, sessionBridge: false });
+  try {
+    const sid = "s_inflight";
+    say(t.history, sid, "hello there");
+    t.adapter.onSessionCreated(sid);
+    await t.adapter.prepareTurn({ sessionId: sid, text: "hello there my friend", submissionId: "x" }); // a turn is sent
+    await wait(2_600); // quiet for longer than the limit, and two sweeps
+    assert.deepEqual(sessionEnds(t.hs), [], "a turn in flight keeps its session open");
+    t.harness.emit("session/event", { type: "turn_completed", session_id: sid }); // the turn ends
+    assert.ok(await until(() => sessionEnds(t.hs).includes(`openworker/${sid}`), 8_000), "now it is idle, and is ended");
+    await wait(1_500);
+    assert.equal(sessionEnds(t.hs).length, 1, "once");
+  } finally { await t.done(); }
+});

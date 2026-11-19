@@ -43,6 +43,10 @@ const CLOSE_MARGIN_MS = 15_000;
 const SHUTDOWN_BUDGET_MS = 45_000;
 /** Sessions of earlier runs ended per start. */
 const ORPHANS_PER_START = 10;
+/** A turn in flight keeps its session from being called idle for this long at most (a turn whose end was never seen must not keep a session open for ever). */
+const RUNNING_CAP_MS = 6 * 3_600_000;
+/** The journal events that end a turn, however it ended. */
+const TURN_ENDED = new Set(["turn_completed", "turn_failed", "turn_cancelled", "turn_recovered"]);
 /** Attached images are deleted after this long. */
 const UPLOAD_KEEP_MS = 7 * 24 * 3_600_000;
 
@@ -274,6 +278,9 @@ export class HeliconAdapter {
   /** Sessions of agents that do not get memory: nothing of them is recalled, archived or ended. */
   private readonly excluded = new Set<string>();
 
+  /** Sessions with a turn in flight (when it was sent): a turn that waits for an approval, a slow tool or a slow model is quiet, but the session is not idle. */
+  private readonly running = new Map<string, number>();
+
   // ── recall ───────────────────────────────────────────────────────────────
 
   private async fetchBridge(budget: HookBudget): Promise<BridgeTurn> {
@@ -318,6 +325,7 @@ export class HeliconAdapter {
     if (this.excluded.has(sessionId)) return userAddendum;
     try {
       this.touch(sessionId);
+      this.running.set(sessionId, Date.now());
       if (args.images?.length) await this.keepAttachments(sessionId, args.images);
       const key = `${sessionId}:${submissionId}`;
       let ours: string | undefined;
@@ -466,6 +474,9 @@ export class HeliconAdapter {
     }
     if (method !== "session/event") return;
     const e = params as { type?: unknown; session_id?: unknown } | null;
+    if (typeof e?.session_id === "string" && typeof e.type === "string" && TURN_ENDED.has(e.type)) {
+      this.running.delete(e.session_id);
+    }
     if (e?.type === "turn_completed" && typeof e.session_id === "string" && !this.excluded.has(e.session_id)) {
       this.touch(e.session_id); // also makes the session known to the adapter
       this.capture.schedule(e.session_id);
@@ -533,6 +544,7 @@ export class HeliconAdapter {
 
   /** `session.close()`: sends what is pending and ends the session on HeliconSearch. Bounded; never throws. */
   async onSessionClose(sessionId: string): Promise<void> {
+    this.running.delete(sessionId);
     if (this.excluded.delete(sessionId)) return;
     if (this.cfg.syncTranscript) {
       await HeliconAdapter.within(this.endSession(sessionId, this.cfg.closeWaitMs), this.cfg.closeWaitMs + CLOSE_MARGIN_MS);
@@ -551,6 +563,8 @@ export class HeliconAdapter {
     if (!this.cfg.syncTranscript || limit <= 0) return;
     const now = Date.now();
     for (const id of this.knownSessions()) {
+      const since = this.running.get(id);
+      if (since !== undefined && now - since < RUNNING_CAP_MS) continue; // a turn is in flight
       const rec = this.store.get(id);
       if (!rec.ended && now - rec.lastActive >= limit) void this.endSession(id, 0);
     }
