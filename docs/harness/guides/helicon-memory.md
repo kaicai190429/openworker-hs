@@ -21,6 +21,25 @@ With it on:
   `session.close()`, when you shut the harness down, when it has been idle for 30 minutes, and, for a run that
   died, at the next start.
 
+## Quick start
+
+You need a HeliconSearch server you can reach (by default `http://127.0.0.1:5001`) and a tenant token for it.
+
+```sh
+# 1. administrator, once: register a tenant and write the configuration (the token stays in an environment variable)
+HELICON_TENANT_ADMIN_PW=<administrator password>   node scripts/helicon-provision.mjs --url http://hs-host:5001 --tenant my-app --env HELICON_TENANT_TOKEN
+# 2. put the file it wrote (./helicon-memory.json) in your harness stateDir, and give the process the token
+export HELICON_TENANT_TOKEN=hs_...
+# 3. run your application as usual
+```
+
+Register agents with `harness.createAgent` (they then get the memory tools). To check that it works, set
+`"debug": true` and read `<stateDir>/helicon-memory/adapter.log`: an `adapter on:` line at start, then per turn the
+recall (`auto_recall injected ...`) and what was archived (`archived turns=...`). If memory is off for a reason (a bad
+file, no token) the harness still starts and Node prints `helicon-memory is off: ...`. Facts are extracted by
+HeliconSearch's model, which takes seconds to minutes: a fact told in one session is recalled from others once that has
+happened.
+
 ## Turn it on
 
 Create `helicon-memory.json` in the harness `stateDir` (or point `OPENWORKER_HELICON_CONFIG` at a file
@@ -149,8 +168,9 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
   `harness.createAgent`.
 - Each turn waits for recall before it is sent, at most `hookTimeoutMs` (HeliconSearch normally answers in 1-2 s).
 
-- TypeScript SDK with the managed engine process only. A Rust application or a `Harness.connect()` service
-  client does not get it.
+- TypeScript SDK with the managed engine process only. A `Harness.connect()` service client does not get it. A Rust
+  application uses the Rust SDK's own memory extension (`helicon-memory-rust.md`), which reads the same
+  `helicon-memory.json`.
 - Recall covers the turns you send through a `Session`. Sub-agents and team members started by the engine, and
   turns the engine starts by itself (timers), are not given recalled memory, and whether they are captured has
   not been verified.

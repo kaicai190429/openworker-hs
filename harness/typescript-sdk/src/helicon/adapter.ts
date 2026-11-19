@@ -505,7 +505,8 @@ export class HeliconAdapter {
         rec.ended = true;
         this.store.save(sessionId);
         this.logger.info(`[${PLUGIN_ID}] session end status=${r.status} memory_id=${r.memory_id ?? "none"} session=${hsId}`);
-        if (r.status === "closed" && !r.memory_id) {
+        // (the server also summarises on its own; summaryOnSessionEnd off leaves it at that)
+        if (r.status === "closed" && !r.memory_id && this.cfg.summaryOnSessionEnd) {
           // the summary is made on the server: ask for it, without waiting
           void this.client
             .sessionSummary({ session_id: hsId, agent_id: this.cfg.agentId, project_id: this.cfg.projectId })

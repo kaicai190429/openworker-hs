@@ -84,6 +84,7 @@ See the [Skill guide](../../skills/README.md) and runnable
 | Change models or refresh credentials | [Models and credentials](../../docs/harness/guides/providers.md) |
 | Resume a conversation or delegate work | [Sessions and teams](../../docs/harness/guides/sessions.md) |
 | Accept images, PDFs and text files | [Attachments](../../docs/harness/guides/attachments.md) |
+| Remember across sessions (and search images and videos) with HeliconSearch | [HeliconSearch memory](../../docs/harness/guides/helicon-memory.md) |
 | Isolate tools and inspect content | [OpenShell](../../docs/harness/guides/openshell.md) · [Guardrails](../../docs/harness/guides/guardrails.md) |
 | Inspect turns and export traces | [Observability](../../docs/harness/guides/observability.md) |
 | Run a shared service | [Deployment options](../../docs/harness/guides/deployment.md) |

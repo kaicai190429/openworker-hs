@@ -782,3 +782,14 @@ test("without syncTranscript a session is not ended on HeliconSearch, but closin
     assert.deepEqual(sessionEnds(t.hs), []);
   } finally { await t.done(); }
 });
+
+test("summaryOnSessionEnd: false leaves the summary to HeliconSearch", async () => {
+  const t = await attach({}, { summaryOnSessionEnd: false });
+  try {
+    say(t.history, "s_nosum", "bye");
+    await t.adapter.onSessionClose("s_nosum");
+    assert.ok(t.hs.calls.some((c) => c.path === "/v1/memory/session/end"), "the session is still ended");
+    await wait(500);
+    assert.equal(t.hs.calls.some((c) => c.path === "/v1/memory/session/summary"), false, "but the summary is not asked for");
+  } finally { await t.done(); }
+});
