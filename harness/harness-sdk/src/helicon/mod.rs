@@ -411,12 +411,14 @@ impl Inner {
         let mut store = self.store.lock().unwrap();
         let rec = store.get(session_id);
         let now = now_ms();
-        if !rec.ended && now.saturating_sub(rec.last_active) < 5_000 {
-            return; // saving on every event is not needed
-        }
+        // activity is noted at once (the idle sweep reads it from memory), and written to the file at most
+        // every few seconds, or at once when it reopens a session that had been ended
         rec.last_active = now;
-        rec.ended = false;
-        store.save(session_id);
+        let reopened = std::mem::replace(&mut rec.ended, false);
+        if reopened || now.saturating_sub(rec.saved_at) >= 5_000 {
+            rec.saved_at = now;
+            store.save(session_id);
+        }
     }
 
     fn on_notification(self: &Arc<Self>, notification: Notification) {
@@ -1364,5 +1366,35 @@ mod tests {
         });
         settle().await;
         assert!(hs.requests().is_empty(), "{:?}", hs.requests());
+    }
+
+    #[tokio::test]
+    async fn activity_is_noted_at_once_but_written_to_the_file_only_every_few_seconds() {
+        let hs = MockHs::start(|req| panic!("unexpected {}", req.path)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({}));
+        let inner = &ext.inner;
+        let file = dir.path().join("helicon-memory/sessions/s1.json");
+        let saved = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap()
+        };
+        ext.on_session_created(&session("s1"));
+        inner.touch("s1");
+        let first = saved()["lastActive"].as_u64().unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        inner.touch("s1");
+        // in memory it moved on (what the idle sweep reads), in the file it did not
+        assert!(inner.store.lock().unwrap().get("s1").last_active > first);
+        assert_eq!(saved()["lastActive"].as_u64().unwrap(), first);
+        // but reopening a session that had been ended is written at once
+        {
+            let mut store = inner.store.lock().unwrap();
+            store.get("s1").ended = true;
+            store.save("s1");
+        }
+        assert_eq!(saved()["ended"], true);
+        inner.touch("s1");
+        assert_eq!(saved()["ended"], false);
+        assert!(saved()["lastActive"].as_u64().unwrap() > first);
     }
 }

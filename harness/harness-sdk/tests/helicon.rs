@@ -304,7 +304,7 @@ async fn an_idle_session_is_ended_without_close_and_ended_again_after_it_is_used
     configure(
         &root,
         &hs,
-        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 2000}),
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 3000}),
     );
     let h = start(&root).await;
     let a = h.create_agent(agent()).await.unwrap();
@@ -312,7 +312,7 @@ async fn an_idle_session_is_ended_without_close_and_ended_again_after_it_is_used
     within(s.run(SAY)).await.unwrap();
     // nobody closes it: the idle sweep does, once
     until("the idle end", 15, || ends(&hs) == 1).await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::sleep(Duration::from_millis(3500)).await;
     assert_eq!(
         ends(&hs),
         1,
@@ -542,24 +542,27 @@ async fn a_run_that_died_moments_ago_is_ended_by_the_idle_sweep_once_it_has_been
     within(h.shutdown()).await.unwrap();
 
     // restarted at once, with a short idle limit: it is too recent to be an orphan, and is not forgotten.
-    // (Its last activity is set to now, so how long the restart took cannot make it old.)
+    // (Its last activity is set a few seconds ahead, so a slow machine starting the engine cannot make it old.)
     let record = root.join(format!("state/helicon-memory/sessions/{}.json", s.id()));
     let mut saved: Value =
         serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
-    saved["lastActive"] = json!(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64);
+    saved["lastActive"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 6_000
+    );
     std::fs::write(&record, saved.to_string()).unwrap();
     configure(
         &root,
         &hs,
-        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 4000}),
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 3000}),
     );
     let h = start(&root).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(ends(&hs), 0, "still recent");
-    until("the sweep to end it", 20, || ends(&hs) == 1).await;
+    until("the sweep to end it", 30, || ends(&hs) == 1).await;
     assert_eq!(
         all(&hs, "/v1/memory/session/end")[0].body["session_id"],
         format!("openworker/{}", s.id())

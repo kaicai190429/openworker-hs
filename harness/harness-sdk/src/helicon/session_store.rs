@@ -29,6 +29,10 @@ pub(crate) struct SessionRecord {
     /// HeliconSearch was told the session is over; a later turn clears it.
     #[serde(default)]
     pub ended: bool,
+    /// When `last_active` was last written to the file (not itself saved): activity is noted in memory at
+    /// once, and written at most every few seconds.
+    #[serde(skip)]
+    pub saved_at: u64,
 }
 
 impl SessionRecord {
@@ -40,6 +44,7 @@ impl SessionRecord {
             extract_next: 0,
             last_active: now_ms(),
             ended: false,
+            saved_at: 0,
         }
     }
 }
