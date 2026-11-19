@@ -1030,6 +1030,19 @@ impl super::Approvals {
     }
 }
 
+/// The text parts of a user input, in order (attachments contribute nothing).
+fn user_text(input: &crate::UserInput) -> String {
+    input
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            crate::InputContent::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,17 +1220,4 @@ mod tests {
             Some("req_fixture")
         );
     }
-}
-
-/// The text parts of a user input, in order (attachments contribute nothing).
-fn user_text(input: &crate::UserInput) -> String {
-    input
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            crate::InputContent::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }

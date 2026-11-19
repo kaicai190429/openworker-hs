@@ -1,10 +1,10 @@
 //! Development Rust API for the same engine embedded or over managed private stdio.
 //! No request is automatically resubmitted after transport failure.
 pub mod agents;
-pub mod extension;
-mod helicon;
 #[cfg(feature = "evaluation-export")]
 mod evaluation_export;
+pub mod extension;
+mod helicon;
 mod instrumentation;
 pub mod recording;
 pub use recording::{RecordingConfig, RecordingDatabase, TraceQuery};
