@@ -12,7 +12,9 @@ export * from "./attempt-output.js";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { Transport } from "./transport.js";
-import { agentWire } from "./config.js";
+import { agentWire, resolveOptions } from "./config.js";
+import { HeliconAdapter } from "./helicon/adapter.js";
+import { adapterOf, imageAttachments, messageText, setAdapter } from "./helicon/registry.js";
 import {sandboxWire} from "./team-placement.js";
 import {
   ToolImageResult,
@@ -348,6 +350,9 @@ export class Harness {
       for(const {ref,callback} of pending)await harness.registerSafetyHandler(ref,callback);
       for (const provider of options.modelProviders ?? [])
         await harness.setModelProvider(provider);
+      // Helicon memory: on only when a helicon-memory.json configuration exists (see ./helicon)
+      const memory = await HeliconAdapter.attach(harness, resolveOptions(options).stateDir);
+      if (memory) setAdapter(harness, memory);
       return harness;
     } catch (e) {
       await transport.stop();
@@ -627,15 +632,19 @@ export class Harness {
           : {}),
       }),
     );
-    return this.resume(v.session as SessionRef);
+    const created = await this.resume(v.session as SessionRef);
+    adapterOf(this)?.onSessionCreated(created.id, created.agent);
+    return created;
   }
   async resume(reference: SessionRef): Promise<Session> {
     const session = new Session(this, structuredClone(reference));
     for (const id of session.memberIds())
       await this.request("session/attach", { session_id: id });
+    adapterOf(this)?.onSessionAttached(session.id, session.agent);
     return session;
   }
-  shutdown(): Promise<void> {
+  async shutdown(): Promise<void> {
+    await adapterOf(this)?.shutdown();
     return this.transport.stop();
   }
   /** Read-only recovery: reconnect and repeat a journal/snapshot read, never a mutation. */
@@ -695,7 +704,7 @@ export class AgentHandle {
       throw new HarnessError("Setup", "Update the host to configure per-call output limits");
     if (this.harness.capabilities.dynamic_agents !== true)
       throw new HarnessError("Setup", "Host does not support dynamic agents");
-    const { name, defaultModel, ...rest } = definition;
+    const { name, defaultModel, ...rest } = adapterOf(this.harness)?.decorateAgent(definition) ?? definition;
     await this.harness.request("agent/register", {
       agent: agentWire({
         ...rest,
@@ -852,6 +861,7 @@ export class Session {
         "Mixed or unknown session input fields",
       );
     const submissionId = options.submissionId ?? randomUUID();
+    const addendum = control ? options.instructionAddendum : await this.recalled(input, submissionId, options.instructionAddendum);
     const wire = (value.type === "approval" || value.type === "answer")
       ? {
           ...value,
@@ -869,7 +879,7 @@ export class Session {
         submission_id: submissionId,
         input: wire,
         limits: options.limits,
-        instruction_addendum: options.instructionAddendum,
+        instruction_addendum: addendum,
         auto_approver_context: options.autoApproverContext,
         compaction: options.compaction === undefined ? undefined : { additional_instructions: options.compaction.additionalInstructions },
         output: options.output,
@@ -993,7 +1003,7 @@ export class Session {
           text: typeof input==="string"?input:undefined,
           content,
           limits:options.limits,
-          instruction_addendum:options.instructionAddendum,
+          instruction_addendum:await this.recalled(input, submissionId, options.instructionAddendum),
           auto_approver_context:options.autoApproverContext,
           compaction: options.compaction === undefined ? undefined : { additional_instructions: options.compaction.additionalInstructions },
           output:options.output,
@@ -1044,7 +1054,14 @@ export class Session {
       }),
     );
   }
+  /** The turn's application addendum: the caller's own, plus recalled memory when the Helicon adapter is on. */
+  private async recalled(input: unknown, submissionId: string, addendum: string | undefined): Promise<string | undefined> {
+    const memory = adapterOf(this.harness);
+    if (!memory) return addendum; // nothing about the input is looked at when memory is off
+    return memory.prepareTurn({ sessionId: this.id, text: messageText(input), submissionId, userAddendum: addendum, images: imageAttachments(input) });
+  }
   async close(): Promise<void> {
+    await adapterOf(this.harness)?.onSessionClose(this.id);
     checkMemberErrors(
       await this.harness.request("agent/close", { session_id: this.id }),
     );
