@@ -16,6 +16,16 @@ use tokio::{
     net::TcpListener,
 };
 
+/// The URL of a port that nothing listens on (one that was free a moment ago), for "the server is down".
+pub fn nothing_listens() -> String {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!("http://127.0.0.1:{port}")
+}
+
 #[derive(Clone, Debug)]
 pub struct Request {
     pub method: String,

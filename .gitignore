@@ -34,3 +34,6 @@ dist/
 
 # Reviewer eval run outputs stay local; the study archive lives in ocw-context (OPE-225).
 /reports/
+
+# State of harness/harness-sdk/examples/helicon_memory.rs (it writes its configuration and log there).
+/harness/.helicon-example-state/

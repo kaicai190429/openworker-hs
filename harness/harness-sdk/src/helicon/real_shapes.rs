@@ -1,7 +1,8 @@
 //! The extension against answers HeliconSearch really gave: `tests/fixtures/helicon/*.json` were recorded
 //! from a running server (with a throw-away agent id; the bridge's texts are replaced by placeholders).
-//! The fake servers of the other tests answer what their author expects; these answer what the server does,
-//! so a change of the server's shapes that the code does not follow shows up here.
+//! The fake servers of the other tests answer what their author expects; these answer what the server did
+//! when they were recorded. They are files: a later change of the server's shapes shows up only once a
+//! fixture is recorded again (the live tests, `--features helicon-live-test`, talk to a server that is there).
 use super::{
     budget::{BudgetSource, RecallBudgets},
     capture::{CaptureDeps, CaptureEngine},

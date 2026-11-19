@@ -21,6 +21,8 @@ pub(crate) struct HistoryPage {
     pub items: Vec<(usize, Value)>,
     /// The next index to read from.
     pub next: usize,
+    /// The read stopped (a very long history) with more left: `next` is not the end of the history.
+    pub more: bool,
 }
 
 /// Where a session's history is read from: the engine, or a stand-in in tests.
@@ -69,6 +71,7 @@ async fn read_history(
 ) -> Result<HistoryPage, String> {
     let mut items = Vec::new();
     let mut cursor = after;
+    let mut more_left = false;
     for _ in 0..MAX_PAGES {
         let page = client
             .request(
@@ -88,6 +91,7 @@ async fn read_history(
             .unwrap_or(cursor);
         let more = page["has_more"] == Value::Bool(true) && next > cursor;
         cursor = next;
+        more_left = more;
         if !more {
             break;
         }
@@ -95,6 +99,7 @@ async fn read_history(
     Ok(HistoryPage {
         items,
         next: cursor,
+        more: more_left,
     })
 }
 
@@ -296,6 +301,7 @@ mod tests {
                 (2, json!({"role":"user","content":"b"})),
             ],
             next: 3,
+            more: false,
         };
         let messages = to_messages(&page, &mut ctx(&mut own));
         assert_eq!(messages.len(), 3);

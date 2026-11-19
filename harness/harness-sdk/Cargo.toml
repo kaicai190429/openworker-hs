@@ -20,6 +20,9 @@ recording-postgres = ["recording", "openworker-observability/postgres"]
 guardrails = ["openworker-runtime/guardrails", "openworker-store-postgres/guardrails"]
 compliance = ["openworker-runtime/compliance", "openworker-store-postgres/compliance"]
 test-support = []
+# The tests that talk to a real HeliconSearch (HELICON_LIVE_URL and HELICON_LIVE_TOKEN): not built otherwise,
+# so that a run of the whole suite (CI runs it with --include-ignored) neither needs nor fails for want of one.
+helicon-live-test = []
 compliance-export = ["compliance", "openworker-runtime/compliance-export"]
 security-adapters = ["guardrails", "dep:openworker-security-adapters"]
 

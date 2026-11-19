@@ -241,7 +241,7 @@ async fn an_unreachable_heliconsearch_never_fails_a_turn() {
     // nothing listens on this port
     std::fs::write(
         state.join("helicon-memory.json"),
-        json!({"baseUrl": "http://127.0.0.1:9", "apiKey": "k", "timeoutMs": 1000, "closeWaitMs": 0}).to_string(),
+        json!({"baseUrl": hs_mock::nothing_listens(), "apiKey": "k", "timeoutMs": 1000, "closeWaitMs": 0}).to_string(),
     )
     .unwrap();
     let h = start(&root).await;
@@ -481,7 +481,8 @@ async fn a_session_that_predates_the_configuration_is_archived_from_its_first_me
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn changing_the_memory_configuration_changes_the_agent_definition_and_the_sdk_says_so() {
+async fn changing_the_memory_configuration_changes_the_agent_definition_so_a_new_agent_id_is_needed(
+) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
@@ -520,6 +521,40 @@ async fn changing_the_memory_configuration_changes_the_agent_definition_and_the_
     )
     .await
     .unwrap();
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_option_that_changes_a_tools_text_does_not_switch_the_memory_off_at_the_next_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(&root, &hs, json!({}));
+    let h = start(&root).await;
+    h.create_agent(agent()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+
+    // topK and autoRecall are written into the descriptions of the memory tools, which the engine keeps
+    // (a tool of the same name must not change)
+    configure(&root, &hs, json!({"topK": 7, "autoRecall": false}));
+    let h = start(&root).await;
+    let a = h
+        .create_agent(
+            Agent::new("assistant-v2")
+                .instructions("Be helpful.")
+                .memory(true)
+                .approvals(Approvals::Never),
+        )
+        .await
+        .unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    within(s.run(SAY)).await.unwrap();
+    let turns = seen(&hs, "/v1/memory/session/turn").await;
+    assert_eq!(
+        turns.body["turns"][0]["content"], SAY,
+        "capture is still on"
+    );
+    within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();
 }
 
@@ -590,15 +625,26 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        // a zombie is dead for this purpose (the field after the command in /proc/<pid>/stat is its state)
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                stat.rsplit(')')
-                    .next()
-                    .and_then(|rest| rest.trim().chars().next())
-                    != Some('Z')
+        // a zombie is dead for this purpose
+        if std::path::Path::new("/proc/self/stat").exists() {
+            // (the field after the command in /proc/<pid>/stat is its state)
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => {
+                    stat.rsplit(')')
+                        .next()
+                        .and_then(|rest| rest.trim().chars().next())
+                        != Some('Z')
+                }
+                Err(_) => false,
             }
-            Err(_) => false,
+        } else {
+            // no /proc (macOS): ps prints the state, or nothing for a process that is gone
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            !state.is_empty() && !state.starts_with('Z')
         }
     }
 }

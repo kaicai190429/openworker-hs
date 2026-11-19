@@ -20,9 +20,11 @@ use super::{
     transcript::extract_turns,
     util::now_ms,
 };
+use futures_util::FutureExt;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
+    panic::AssertUnwindSafe,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -48,6 +50,15 @@ struct LiveState {
     hs_started: bool,
     /// Extraction in flight or done up to here (>= the saved `extract_next`); lowered when one fails.
     extracted_to: Option<usize>,
+}
+
+/// One extraction in flight: counted in `Live::pending` for as long as this exists.
+struct Counted(Arc<Live>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.pending.send_modify(|n| *n = n.saturating_sub(1));
+    }
 }
 
 struct Live {
@@ -230,6 +241,10 @@ impl CaptureEngine {
         if page.next <= from {
             return Ok(true);
         }
+        if page.more {
+            // a history longer than one read covers: the rest is looked at by the next cycle
+            live.dirty.store(true, Ordering::SeqCst);
+        }
         let messages = {
             let mut state = live.state.lock().unwrap();
             let mut own = std::mem::take(&mut state.own_call_ids);
@@ -279,7 +294,9 @@ impl CaptureEngine {
                         "session/turn answered without per-entry receipts session={hs_id}"
                     ));
                 };
-                let mut retry_from: Option<usize> = None;
+                // what HeliconSearch took (stored, replayed, or kept under a conflict): a turn it gave no
+                // receipt for, or an unusable one, was not archived and is sent again
+                let mut taken: HashSet<usize> = HashSet::new();
                 {
                     let mut state = live.state.lock().unwrap();
                     for e in results {
@@ -292,6 +309,7 @@ impl CaptureEngine {
                         if let (true, Some(turn_id), Some(hash)) =
                             (matches!(status, "stored" | "replayed"), turn_id, hash)
                         {
+                            taken.insert(index);
                             state.refs.insert(
                                 index,
                                 ArchiveRef {
@@ -300,6 +318,7 @@ impl CaptureEngine {
                                 },
                             );
                         } else if status == "revision_conflict" {
+                            taken.insert(index);
                             state.refs.remove(&index);
                             let incoming = e["incoming_hash"].as_str().unwrap_or("").to_owned();
                             if state.conflicts.get(&index) != Some(&incoming) {
@@ -310,11 +329,14 @@ impl CaptureEngine {
                                 ));
                                 state.conflicts.insert(index, incoming);
                             }
-                        } else {
-                            retry_from = Some(retry_from.map_or(index, |r| r.min(index)));
                         }
                     }
                 }
+                let retry_from = turns
+                    .iter()
+                    .filter_map(|t| t["turn_index"].as_u64().map(|i| i as usize))
+                    .filter(|i| !taken.contains(i))
+                    .min();
                 let next = retry_from.unwrap_or(page.next);
                 {
                     let mut store = d.store.lock().unwrap();
@@ -336,7 +358,7 @@ impl CaptureEngine {
             let slice: Vec<Option<Value>> = messages.into_iter().take(upto).collect();
             self.spawn_extraction(session_id, live.clone(), slice, extract_from, upto);
         }
-        Ok(upto >= page.next)
+        Ok(upto >= page.next && !page.more)
     }
 
     fn spawn_extraction(
@@ -358,22 +380,30 @@ impl CaptureEngine {
         live.pending.send_modify(|n| *n += 1);
         let lock = live.extraction_lock.clone();
         tokio::spawn(async move {
-            {
-                let _turn = lock.lock().await;
-                extract(
-                    &cfg,
-                    &client,
-                    &logger,
-                    &store,
-                    &live,
-                    &id,
-                    &messages,
-                    start_index,
-                    upto,
-                )
-                .await;
+            // (counts down however the extraction ends: a flush waits for this number to reach zero)
+            let _counted = Counted(live.clone());
+            let _turn = lock.lock().await;
+            let done = AssertUnwindSafe(extract(
+                &cfg,
+                &client,
+                &logger,
+                &store,
+                &live,
+                &id,
+                &messages,
+                start_index,
+                upto,
+            ))
+            .catch_unwind()
+            .await;
+            if done.is_err() {
+                let mut state = live.state.lock().unwrap();
+                state.extracted_to =
+                    Some(state.extracted_to.unwrap_or(start_index).min(start_index));
+                logger.warn(&format!(
+                    "{TAG} extraction panicked and will be retried from {start_index} session={id}"
+                ));
             }
-            live.pending.send_modify(|n| *n = n.saturating_sub(1));
         });
     }
 }
@@ -464,9 +494,7 @@ mod tests {
             dir.path().to_path_buf(),
             logger.clone(),
         )));
-        let history = Arc::new(FakeHistory {
-            items: Mutex::new(history),
-        });
+        let history = Arc::new(FakeHistory::new(history));
         let engine = CaptureEngine::new(CaptureDeps {
             cfg: cfg.clone(),
             client: HeliconClient::new(&cfg.base_url, &cfg.api_key, 2_000, logger.clone(), false),
@@ -617,6 +645,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_history_longer_than_one_read_is_archived_to_its_end_before_it_counts_as_caught_up() {
+        let hs = archiving_hs().await;
+        let items: Vec<(usize, Value)> = (0..6)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (i, user(&format!("I like thing number {i}")))
+                } else {
+                    (i, assistant("ok"))
+                }
+            })
+            .collect();
+        let (engine, store, _dir, history) = setup(&hs, "operator", items);
+        *history.per_read.lock().unwrap() = Some(2); // a read covers two items, the history has six
+        assert!(engine.flush("s1", 5_000).await, "everything is archived");
+        assert_eq!(store.lock().unwrap().get("s1").archive_next, 6);
+        let turns = hs
+            .requests()
+            .into_iter()
+            .filter(|r| r.path == "/v1/memory/session/turn")
+            .count();
+        assert_eq!(turns, 3, "three reads, three archives");
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_server_gave_no_receipt_for_is_sent_again() {
+        let calls = Arc::new(Mutex::new(Vec::<Vec<Value>>::new()));
+        let c = calls.clone();
+        let hs = MockHs::start(move |req| match req.path.as_str() {
+            "/v1/memory/session/start" => Reply::ok(json!({})),
+            "/v1/memory/session/turn" => {
+                let turns = req.body["turns"].as_array().unwrap().clone();
+                let first_call = {
+                    let mut seen = c.lock().unwrap();
+                    seen.push(turns.iter().map(|t| t["turn_index"].clone()).collect());
+                    seen.len() == 1
+                };
+                // the first answer carries a receipt for the first turn only
+                let answered = if first_call { &turns[..1] } else { &turns[..] };
+                let results: Vec<Value> = answered
+                    .iter()
+                    .map(|t| json!({"turn_index": t["turn_index"], "sql_status": "stored", "turn_id": "t", "content_hash": "h"}))
+                    .collect();
+                Reply::ok(json!({"results": results}))
+            }
+            "/v1/memory/add" => Reply::ok(json!({"code": 202, "queued": true, "work_unit_id": "w"})),
+            other => panic!("unexpected {other}"),
+        })
+        .await;
+        let (engine, store, _dir, _h) = setup(
+            &hs,
+            "operator",
+            vec![(0, user("I prefer dark mode")), (1, assistant("Noted."))],
+        );
+        assert!(!engine.flush("s1", 0).await, "a turn is missing a receipt");
+        assert_eq!(store.lock().unwrap().get("s1").archive_next, 1);
+        assert!(engine.flush("s1", 5_000).await);
+        assert_eq!(store.lock().unwrap().get("s1").archive_next, 2);
+        let seen = calls.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[1],
+            vec![json!(1)],
+            "only the turn without a receipt is sent again"
+        );
+    }
+
+    #[tokio::test]
     async fn direct_mode_stores_only_the_sentences_that_pass_the_rules() {
         let hs = MockHs::start(|req| match req.path.as_str() {
             "/v1/memory/session/start" => Reply::ok(json!({})),
@@ -718,7 +813,8 @@ mod tests {
     #[tokio::test]
     async fn scheduling_debounces_into_one_cycle() {
         let hs = archiving_hs().await;
-        let (engine, _s, _d, _h) = setup(&hs, "operator", vec![(0, user("I prefer dark mode"))]);
+        let (engine, _s, _d, history) =
+            setup(&hs, "operator", vec![(0, user("I prefer dark mode"))]);
         for _ in 0..5 {
             engine.schedule("s1");
         }
@@ -729,6 +825,12 @@ mod tests {
                 .filter(|r| r.path == "/v1/memory/session/turn")
                 .count(),
             1
+        );
+        // (a second cycle would stop short of the server, at "nothing new": it still reads the history)
+        assert_eq!(
+            history.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "five schedules, one cycle"
         );
         assert_eq!(engine.sessions(), vec!["s1".to_owned()]);
         engine.release("s1");

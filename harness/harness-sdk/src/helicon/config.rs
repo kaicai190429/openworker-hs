@@ -5,6 +5,30 @@
 //! ignored here: this extension is memory only.
 use serde_json::{Map, Value};
 
+/// The server's token: a string that does not print itself (a `{:?}` of the configuration, in a log or a
+/// panic message, must not carry it).
+#[derive(Clone)]
+pub(crate) struct Secret(String);
+
+impl Secret {
+    pub(crate) fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
 pub(crate) const DEFAULT_AGENT_ID: &str = "openworker";
 pub(crate) const DEFAULT_TOP_K: usize = 5;
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -54,7 +78,7 @@ pub(crate) struct MemoryConfig {
     pub recall_min_score: f64,
     pub recall_top_k: usize,
     pub custom_triggers: Option<Vec<String>>,
-    pub api_key: String,
+    pub api_key: Secret,
     pub debug: bool,
     pub sync_transcript: bool,
     /// Ask HeliconSearch for the session's summary right after ending it (when it did not make one itself).
@@ -313,6 +337,12 @@ impl MemoryConfig {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or("baseUrl is required")?;
+        // (a number or a list here would silently put the memories in another agent's partition)
+        for key in ["agentId", "projectId"] {
+            if get(key).is_some_and(|v| !v.is_string() && !v.is_null()) {
+                return Err(format!("{key} must be a string"));
+            }
+        }
         let agent_id = match get("agentId").and_then(Value::as_str) {
             Some(s) if !s.trim().is_empty() => resolve_env(s, env)?.trim().to_owned(),
             _ => DEFAULT_AGENT_ID.to_owned(),
@@ -323,7 +353,7 @@ impl MemoryConfig {
         };
         let int = |k: &str, min: i64, max: i64, d: i64| int_in_range(get(k), k, min, max, d);
         let float = |k: &str, min: f64, max: f64, d: f64| float_in_range(get(k), k, min, max, d);
-        let idle_end_ms = if get("idleEndMs").and_then(Value::as_i64) == Some(0) {
+        let idle_end_ms = if get("idleEndMs").and_then(Value::as_f64) == Some(0.0) {
             0
         } else {
             int("idleEndMs", 1_000, 86_400_000, 1_800_000)? as u64
@@ -355,7 +385,7 @@ impl MemoryConfig {
             recall_min_score: float("recallMinScore", 0.0, 1.0, DEFAULT_RECALL_MIN_SCORE)?,
             recall_top_k: int("recallTopK", 1, 20, DEFAULT_RECALL_TOP_K as i64)? as usize,
             custom_triggers: custom_triggers(get("customTriggers"))?,
-            api_key: resolve_api_key(get("apiKey"), env),
+            api_key: Secret::new(resolve_api_key(get("apiKey"), env)),
             debug: boolean(get("debug"), false)?,
             sync_transcript: boolean(get("syncTranscript"), true)?,
             summary_on_session_end: boolean(get("summaryOnSessionEnd"), true)?,
@@ -402,7 +432,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.base_url, "http://127.0.0.1:5001");
-        assert_eq!(cfg.api_key, "hs_secret");
+        assert_eq!(&*cfg.api_key, "hs_secret");
+        assert!(
+            !format!("{cfg:?}").contains("hs_secret"),
+            "the token is not printed"
+        );
         assert_eq!(cfg.agent_id, "openworker");
         assert_eq!(cfg.capture_mode, CaptureMode::Operator);
         assert!(cfg.replace_builtin_memory && cfg.auto_recall && cfg.auto_capture);
@@ -417,7 +451,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(cfg.api_key, UNCONFIGURED_API_KEY);
+        assert_eq!(&*cfg.api_key, UNCONFIGURED_API_KEY);
     }
 
     #[test]
@@ -431,6 +465,21 @@ mod tests {
         );
         assert!(bad(json!({"baseUrl":"http://h","captureMode":"x"})).contains("captureMode"));
         assert!(bad(json!({"baseUrl":"http://h","autoRecall":"yes"})).contains("expected boolean"));
+        // an id that is not a string would silently be another partition
+        assert!(
+            bad(json!({"baseUrl":"http://h","agentId":42})).contains("agentId must be a string")
+        );
+        assert!(bad(json!({"baseUrl":"http://h","projectId":["p"]}))
+            .contains("projectId must be a string"));
+    }
+
+    #[test]
+    fn idle_end_zero_means_never_however_it_is_written() {
+        for zero in [json!(0), json!(0.0)] {
+            let cfg = MemoryConfig::parse(&json!({"baseUrl":"http://h","idleEndMs": zero}), &env)
+                .unwrap();
+            assert_eq!(cfg.idle_end_ms, 0);
+        }
     }
 
     #[test]

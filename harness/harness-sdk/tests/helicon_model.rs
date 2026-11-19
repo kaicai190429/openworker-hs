@@ -13,7 +13,8 @@ use helicon_fixture::*;
 use hs_mock::Request;
 use model_mock::{conversation_of, system_of, tool_names, Answer, MockModel};
 use openworker_sdk::{
-    agents::*, ApprovalDecision, Credentials, InputContent, Model, ModelProvider, UserInput,
+    agents::*, ApprovalDecision, Credentials, InputContent, Model, ModelProvider, TurnOptions,
+    UserInput,
 };
 use serde_json::{json, Value};
 
@@ -341,7 +342,7 @@ fn tool_results(request: &Value) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_way_of_sending_a_message_carries_the_recall() {
+async fn each_way_of_sending_a_message_carries_the_recall() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
@@ -363,13 +364,49 @@ async fn every_way_of_sending_a_message_carries_the_recall() {
     )])))
     .await
     .unwrap();
+    let text_input = |text: &str| UserInput::new(vec![InputContent::Text(text.into())]);
+    within(async {
+        s.send_input(text_input("via send_input"), TurnOptions::default())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+    })
+    .await;
+    within(async {
+        let mut stream = s
+            .run_input_streamed(text_input("via run_input_streamed"))
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+    })
+    .await;
+    within(s.run_with_submission("fixed-1", "via run_with_submission"))
+        .await
+        .unwrap();
+    within(async {
+        s.send_with_id("fixed-2", "via send_with_id")
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+    })
+    .await;
 
     let requests = model.requests();
-    assert_eq!(requests.len(), 4);
-    for (request, how) in requests
-        .iter()
-        .zip(["run", "send", "run_streamed", "run_input"])
-    {
+    assert_eq!(requests.len(), 8);
+    for (request, how) in requests.iter().zip([
+        "run",
+        "send",
+        "run_streamed",
+        "run_input",
+        "send_input",
+        "run_input_streamed",
+        "run_with_submission",
+        "send_with_id",
+    ]) {
         let system = system_of(request);
         assert!(
             system.contains("<relevant-memories>") && system.contains("- likes tea"),
@@ -387,7 +424,16 @@ async fn every_way_of_sending_a_message_carries_the_recall() {
         .collect();
     assert_eq!(
         queries,
-        ["via run", "via send", "via run_streamed", "via run_input"]
+        [
+            "via run",
+            "via send",
+            "via run_streamed",
+            "via run_input",
+            "via send_input",
+            "via run_input_streamed",
+            "via run_with_submission",
+            "via send_with_id"
+        ]
     );
     within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();

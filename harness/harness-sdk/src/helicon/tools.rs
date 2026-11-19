@@ -17,7 +17,7 @@ use super::{
     },
     recall::{format_unextracted_excerpts, pick_unextracted_excerpts, turn_label},
     source_ref::make_manual_ref,
-    util::{now_ms, BoundedMap},
+    util::{cut_bytes, now_ms, BoundedMap},
 };
 use crate::Tool;
 use serde_json::{json, Map, Value};
@@ -137,6 +137,19 @@ impl Tools {
         true
     }
 
+    /// Returns one that `take` took, for a search that never got an answer (the server was not
+    /// reachable): it must not count against the message, nor make the agent tell the user "no record".
+    fn give_back(&self, key: &str, what: Use) {
+        let mut uses = self.uses.lock().unwrap();
+        let mut c = uses.get(&key.to_owned()).copied().unwrap_or_default();
+        let n = match what {
+            Use::Searches => &mut c.searches,
+            Use::Opens => &mut c.opens,
+        };
+        *n = n.saturating_sub(1);
+        uses.insert(key.to_owned(), c);
+    }
+
     fn used(&self, key: &str, what: Use) -> u32 {
         let uses = self.uses.lock().unwrap();
         let c = uses.get(&key.to_owned()).copied().unwrap_or_default();
@@ -185,7 +198,10 @@ impl Tools {
         let opts = super::client::CallOptions::deadline(self.budgets.active_deadline_ms());
         let resp = match self.client.query(request, &opts).await {
             Ok(r) => r,
-            Err(err) => return self.failed("memory_recall", &err),
+            Err(err) => {
+                self.give_back(turn_key, Use::Searches);
+                return self.failed("memory_recall", &err);
+            }
         };
         self.budgets.learn_from_response(resp.get("execution"));
         let min = cfg.recall_min_score;
@@ -492,27 +508,8 @@ impl Tools {
             ));
             return "No matching memories found.".into();
         }
-        // one strong match with a source memory id is deleted without asking
-        if candidates.len() == 1 && candidates[0].score > 0.5 {
-            let c = &candidates[0];
-            return match self.client.delete(&c.memory_id).await {
-                Ok(ok) => {
-                    self.logger.info(&format!(
-                        "{TAG} tool=memory_forget -> auto-deleted id={} score={} ok={ok}",
-                        c.memory_id, c.score
-                    ));
-                    if ok {
-                        format!("Forgotten: \"{}\" (id={})", c.text, c.memory_id)
-                    } else {
-                        format!(
-                            "Could not forget \"{}\" (id={}): the server did not delete it.",
-                            c.text, c.memory_id
-                        )
-                    }
-                }
-                Err(err) => self.failed("memory_forget", &err),
-            };
-        }
+        // A search never deletes: a score says how well a memory matched the words, not that it is the one
+        // meant, and a deletion cannot be undone. The agent picks one and calls again with its id.
         let list: Vec<String> = candidates
             .iter()
             .map(|c| {
@@ -529,8 +526,9 @@ impl Tools {
             candidates.len()
         ));
         format!(
-            "Found {} candidates. Specify memoryId:\n{}",
+            "Found {} candidate{}. Nothing was deleted: call memory_forget again with the memoryId of the one to forget:\n{}",
             candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" },
             list.join("\n")
         )
     }
@@ -727,7 +725,11 @@ impl Tools {
             let opts = super::client::CallOptions::deadline(self.budgets.active_deadline_ms());
             let resp = match self.client.query(request, &opts).await {
                 Ok(r) => r,
-                Err(err) => return self.failed("memory_get", &err),
+                Err(err) => {
+                    self.give_back(turn_key, Use::Searches);
+                    self.give_back(turn_key, Use::Opens);
+                    return self.failed("memory_get", &err);
+                }
             };
             self.budgets.learn_from_response(resp.get("execution"));
             let mut candidates: Vec<(String, f64)> = Vec::new();
@@ -943,6 +945,21 @@ fn turn_key(ctx: &crate::ToolContext) -> String {
 }
 
 /// The tools of this extension, as registered under the `helicon` namespace.
+/// What a tool hands the model at most (UTF-8 bytes): a page of a long conversation, or a skill, can be
+/// far larger than is useful, and it would all be paid for in the context of every later step.
+const MAX_TOOL_OUTPUT_BYTES: usize = 60_000;
+
+fn capped(text: String) -> Value {
+    if text.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return Value::String(text);
+    }
+    let kept = cut_bytes(&text, MAX_TOOL_OUTPUT_BYTES);
+    Value::String(format!(
+        "{kept}\n(cut here: the answer was {} bytes, more than the {MAX_TOOL_OUTPUT_BYTES} a tool result is given. Ask for less: a narrower query, a smaller window, or the next page.)",
+        text.len()
+    ))
+}
+
 pub(crate) fn build_tools(tools: &Arc<Tools>) -> Vec<Tool> {
     let cfg = tools.cfg.clone();
     let mut out: Vec<Tool> = Vec::new();
@@ -950,24 +967,19 @@ pub(crate) fn build_tools(tools: &Arc<Tools>) -> Vec<Tool> {
     let t = tools.clone();
     out.push(
         Tool::new("memory_recall")
-            .description(format!(
-                "Search long-term memory. {}One search per user message: make the query cover what is missing.",
-                if cfg.auto_recall {
-                    "Memories relevant to the user's message are already looked up and shown in <relevant-memories>; use this for what they do not cover. "
-                } else {
-                    ""
-                }
-            ))
+            // (The text of a tool must not depend on the configuration: the engine keeps the descriptor of a
+            // tool name and refuses a changed one, which would switch the memory off at the next start.)
+            .description("Search long-term memory. Memories relevant to the user's message may already be shown in <relevant-memories>; use this for what they do not cover. One search per user message: make the query cover what is missing.")
             .input_schema(schema(
                 json!({
                     "query": {"type": "string", "description": "Search query (natural language)"},
-                    "limit": {"type": "number", "description": format!("Max results to return (1-20, default {})", cfg.top_k)},
+                    "limit": {"type": "number", "description": "Max results to return (1-20; a default is used when omitted)"},
                 }),
                 &["query"],
             ))
             .handler(move |args, ctx| {
                 let t = t.clone();
-                async move { Ok(Value::String(t.memory_recall(&args, &turn_key(&ctx)).await)) }
+                async move { Ok(capped(t.memory_recall(&args, &turn_key(&ctx)).await)) }
             }),
     );
 
@@ -988,7 +1000,7 @@ pub(crate) fn build_tools(tools: &Arc<Tools>) -> Vec<Tool> {
                 ))
                 .handler(move |args, _ctx| {
                     let t = t.clone();
-                    async move { Ok(Value::String(t.memory_store(&args).await)) }
+                    async move { Ok(capped(t.memory_store(&args).await)) }
                 }),
         );
     }
@@ -996,7 +1008,7 @@ pub(crate) fn build_tools(tools: &Arc<Tools>) -> Vec<Tool> {
     let t = tools.clone();
     out.push(
         Tool::new("memory_forget")
-            .description("Delete a memory from HeliconSearch by id, or by query when the id is unknown. When using `query`, only auto-deletes when there is a unique high-score match; otherwise returns the candidates so the agent can pick one and call again with `memoryId`.")
+            .description("Delete a memory from HeliconSearch by id. When the id is unknown, give `query` instead: that only lists the candidate memories (nothing is deleted); call again with the `memoryId` of the one to forget.")
             .input_schema(schema(
                 json!({
                     "memoryId": {"type": "string", "description": "32-character hex memory id from memory_recall or the MEMORY_IDS block. Never a `pkg:…` id — those are per-query references and cannot be deleted."},
@@ -1006,7 +1018,7 @@ pub(crate) fn build_tools(tools: &Arc<Tools>) -> Vec<Tool> {
             ))
             .handler(move |args, _ctx| {
                 let t = t.clone();
-                async move { Ok(Value::String(t.memory_forget(&args).await)) }
+                async move { Ok(capped(t.memory_forget(&args).await)) }
             }),
     );
 
@@ -1025,7 +1037,7 @@ pub(crate) fn build_tools(tools: &Arc<Tools>) -> Vec<Tool> {
             .input_schema(schema(Value::Object(get_props), &[]))
             .handler(move |args, ctx| {
                 let t = t.clone();
-                async move { Ok(Value::String(t.memory_get(&args, &turn_key(&ctx)).await)) }
+                async move { Ok(capped(t.memory_get(&args, &turn_key(&ctx)).await)) }
             }),
     );
 
@@ -1039,7 +1051,7 @@ pub(crate) fn build_tools(tools: &Arc<Tools>) -> Vec<Tool> {
             ))
             .handler(move |args, _ctx| {
                 let t = t.clone();
-                async move { Ok(Value::String(t.skill_get(&args).await)) }
+                async move { Ok(capped(t.skill_get(&args).await)) }
             }),
     );
     out
@@ -1125,6 +1137,47 @@ mod tests {
             .starts_with("Found"));
     }
 
+    #[test]
+    fn a_tool_result_is_cut_at_a_limit_and_says_so() {
+        let small = capped("short".into());
+        assert_eq!(small, Value::String("short".into()));
+        // multi-byte text is cut on a character boundary
+        let big = capped("é".repeat(MAX_TOOL_OUTPUT_BYTES));
+        let text = big.as_str().unwrap();
+        assert!(text.contains("(cut here:"), "{}", &text[text.len() - 200..]);
+        assert!(text.len() < MAX_TOOL_OUTPUT_BYTES + 400);
+        assert!(text.starts_with("éé"));
+    }
+
+    #[tokio::test]
+    async fn a_search_the_server_never_answered_does_not_use_up_the_messages_search() {
+        let calls = Arc::new(Mutex::new(0));
+        let c = calls.clone();
+        let hs = MockHs::start(move |_| {
+            let mut n = c.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Reply::status(503, json!({"retmsg": "down"}))
+            } else {
+                Reply::ok(json!({"grounded_facts": [
+                    {"id": "pkg:1", "claim": "likes tea", "score": 0.9, "source_memory_ids": [ID]},
+                ]}))
+            }
+        })
+        .await;
+        let t = tools(&hs, json!({}));
+        let failed = t.memory_recall(&json!({"query": "tea?"}), "s#t1").await;
+        assert!(!failed.starts_with("Found"), "{failed}");
+        // the one search for this message is still there (and the agent was not told "no record")
+        let retried = t.memory_recall(&json!({"query": "tea?"}), "s#t1").await;
+        assert!(retried.starts_with("Found 1 memor"), "{retried}");
+        // and now it is used
+        assert!(t
+            .memory_recall(&json!({"query": "more"}), "s#t1")
+            .await
+            .contains("not searched"));
+    }
+
     #[tokio::test]
     async fn recall_falls_back_to_summaries_and_verbatim_turns() {
         let hs = MockHs::start(|_| {
@@ -1189,13 +1242,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forget_by_query_deletes_one_strong_match_and_lists_several() {
+    async fn forget_by_query_only_lists_candidates_however_strong_the_match() {
         let strong = MockHs::start(|req| {
-            if req.method == "DELETE" {
-                return Reply::ok(json!({"deleted": true}));
-            }
+            assert_ne!(req.method, "DELETE", "a search must not delete");
             Reply::ok(json!({"grounded_facts": [
-                {"claim": "likes tea", "score": 0.8, "support_level": "g", "source_memory_ids": [ID]},
+                {"claim": "likes tea", "score": 1.2, "support_level": "g", "source_memory_ids": [ID]},
                 {"claim": "no id", "score": 0.9, "source_memory_ids": []},
             ]}))
         })
@@ -1203,7 +1254,15 @@ mod tests {
         let text = tools(&strong, json!({}))
             .memory_forget(&json!({"query": "tea"}))
             .await;
-        assert_eq!(text, format!("Forgotten: \"likes tea\" (id={ID})"));
+        assert!(
+            text.starts_with("Found 1 candidate. Nothing was deleted"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("- [{ID}] likes tea (120%)")),
+            "{text}"
+        );
+        assert_eq!(strong.requests().len(), 1, "one search, no delete");
         let other = "fedcba9876543210fedcba9876543210";
         let several = MockHs::start(move |_| {
             Reply::ok(json!({"grounded_facts": [
@@ -1215,7 +1274,10 @@ mod tests {
         let text = tools(&several, json!({}))
             .memory_forget(&json!({"query": "likes"}))
             .await;
-        assert!(text.starts_with("Found 2 candidates. Specify memoryId:"));
+        assert!(
+            text.starts_with("Found 2 candidates. Nothing was deleted"),
+            "{text}"
+        );
         assert!(text.contains(&format!("- [{ID}] likes tea (80%)")));
         assert_eq!(several.requests().len(), 1, "nothing was deleted");
     }

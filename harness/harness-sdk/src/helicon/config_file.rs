@@ -85,7 +85,7 @@ pub(crate) fn load(
         Some(_) => return invalid(&path, "enabled must be true or false".into()),
     }
     match MemoryConfig::parse(&Value::Object(map), env) {
-        Ok(cfg) if cfg.api_key == UNCONFIGURED_API_KEY => invalid(
+        Ok(cfg) if &*cfg.api_key == UNCONFIGURED_API_KEY => invalid(
             &path,
             "apiKey is missing, or the environment variable it names is not set".into(),
         ),
@@ -130,7 +130,7 @@ mod tests {
             r#"{"baseUrl":"http://h:5001","apiKey":"${TOKEN}"}"#,
         );
         match load(dir.path(), &[], &env) {
-            ConfigLoad::Enabled(cfg) => assert_eq!(cfg.api_key, "hs_x"),
+            ConfigLoad::Enabled(cfg) => assert_eq!(&*cfg.api_key, "hs_x"),
             other => panic!("{other:?}"),
         }
     }

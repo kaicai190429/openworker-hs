@@ -1,8 +1,8 @@
-//! Long-term memory with HeliconSearch: the SDK's first agent, plus one configuration file.
+//! Long-term memory with HeliconSearch: a small agent, plus one configuration file.
 //!
 //! Session 1 tells the agent a fact and closes (which waits for HeliconSearch's answer to the extraction
-//! request); session 2 asks about it. The recall happens inside the SDK: this program never mentions memory
-//! except in the configuration it writes. Guide: docs/harness/guides/helicon-memory-rust.md
+//! request); session 2 asks about it. The recall happens inside the SDK: this program mentions memory only in
+//! the configuration it writes and in one tool-approval line. Guide: docs/harness/guides/helicon-memory-rust.md
 //!
 //! ```sh
 //! cd harness                                               # the directory with Cargo.toml
@@ -60,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("HELICON_TENANT_TOKEN").is_ok(),
         "set HELICON_TENANT_TOKEN to your HeliconSearch tenant token"
     );
-    let model = std::env::var("OPENWORKER_MODEL")?;
+    let model = std::env::var("OPENWORKER_MODEL").map_err(|_| {
+        anyhow::anyhow!("set OPENWORKER_MODEL to an exact model ID of your endpoint")
+    })?;
     let state_dir = std::env::current_dir()?.join(".helicon-example-state");
     write_config(&state_dir)?;
 
@@ -95,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         // Register the agent with `create_agent` (not `HarnessBuilder::agent`): that is what gives it the
-        // memory tools. Searching memory needs no approval here; forgetting does.
+        // memory tools. Searching memory needs no approval here; forgetting does (`helicon.memory_forget` is
+        // the tool's name for the application, `helicon__memory_forget` the model's).
         let agent = harness
             .create_agent(
                 Agent::new("memory-example-v1")
@@ -105,7 +108,13 @@ async fn main() -> anyhow::Result<()> {
                     .scheduling(false)
                     .interrupt_on(["helicon.memory_forget"]),
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{e} (this agent names a memory tool: if memory is off, stderr says why, \
+                     `openworker: helicon-memory is off: ...`)"
+                )
+            })?;
         ask(
             &agent,
             "My favorite tea is jasmine green tea. Please remember that.",

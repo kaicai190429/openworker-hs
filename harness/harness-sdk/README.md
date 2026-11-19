@@ -98,14 +98,17 @@ code stays the same except that agents are registered with `harness.create_agent
 ```
 
 ```sh
+cd harness                                                   # the directory of the checkout with Cargo.toml
 cargo build -p openworker-sdk --bin openworker-harness       # agents with tools need the helper
-# tells a fact in one session and asks about it in the next:
+# tells a fact in one session and asks about it in the next (POSIX shell; PowerShell: $env:NAME = "value"):
 HELICON_TENANT_TOKEN=hs_... OPENAI_API_KEY=... OPENWORKER_MODEL=... \
   cargo run -p openworker-sdk --example helicon_memory
 ```
 
-No file, no change. See the [HeliconSearch memory guide](../../docs/harness/guides/helicon-memory-rust.md) for the token,
-options, what is sent where, and troubleshooting.
+You need a HeliconSearch server and its tenant token (its administrator creates one; the guide shows how), a model
+endpoint, and the build environment of the rest of this README. No file, no change. See the
+[HeliconSearch memory guide](../../docs/harness/guides/helicon-memory-rust.md) for the token, options, what is sent where,
+and troubleshooting.
 
 ## Add the next capability
 

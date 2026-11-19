@@ -1,8 +1,10 @@
 //! Against a real HeliconSearch, by hand: `HELICON_LIVE_URL=http://127.0.0.1:5001
-//! HELICON_LIVE_TOKEN=hs_... cargo test -p openworker-sdk --lib live -- --ignored --nocapture`.
+//! HELICON_LIVE_TOKEN=hs_... cargo test -p openworker-sdk --features helicon-live-test --lib live
+//! -- --nocapture`. The feature keeps these out of every other run.
 //!
 //! It uses its own agent id per run, so it never touches other memories of the tenant, and removes the
-//! memory it stores. Nothing here runs without the two variables.
+//! memory it stores (the archived session and the summary HeliconSearch writes for it stay). Without the
+//! variables a test fails, it does not pass without having checked anything.
 use super::{
     capture::{CaptureDeps, CaptureEngine},
     config::MemoryConfig,
@@ -33,19 +35,19 @@ impl HistorySource for Fixed {
                     .cloned()
                     .collect(),
                 next: self.0.len(),
+                more: false,
             })
         })
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a running HeliconSearch: HELICON_LIVE_URL and HELICON_LIVE_TOKEN"]
 async fn live_memory_round_trip() {
     let (Ok(url), Ok(token)) = (
         std::env::var("HELICON_LIVE_URL"),
         std::env::var("HELICON_LIVE_TOKEN"),
     ) else {
-        // run on purpose (--ignored): a silent pass would claim a check that did not happen
+        // run on purpose (the feature): a silent pass would claim a check that did not happen
         panic!("set HELICON_LIVE_URL and HELICON_LIVE_TOKEN to run the live tests");
     };
     let agent = format!("rust-live-{}", now_ms());
@@ -225,16 +227,14 @@ async fn live_memory_round_trip() {
             opened.contains("I prefer oolong tea in the evening"),
             "{opened}"
         );
-        // forgetting by description: one strong match goes, several are listed, none is said
+        // forgetting by description: the candidates are listed (nothing is deleted), or none is said
         let forgot = inner
             .tools
             .memory_forget(&json!({"query": "oolong tea in the evening"}))
             .await;
         eprintln!("memory_forget (by query): {forgot}");
         assert!(
-            forgot.starts_with("Forgotten:")
-                || forgot.starts_with("Found ")
-                || forgot == "No matching memories found.",
+            forgot.starts_with("Found ") || forgot == "No matching memories found.",
             "{forgot}"
         );
     }

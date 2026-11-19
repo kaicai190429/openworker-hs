@@ -79,6 +79,9 @@ impl Extension for Recorder {
     fn before_close<'a>(&'a self, session: &'a SessionInfo) -> BoxFuture<'a, ()> {
         Box::pin(async move { self.note(format!("before_close (agent {})", session.agent)) })
     }
+    fn on_close_failed(&self, session: &SessionInfo) {
+        self.note(format!("close_failed (agent {})", session.agent));
+    }
     fn on_shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move { self.note("shutdown".into()) })
     }
@@ -314,6 +317,75 @@ async fn with_no_extension_a_turn_carries_exactly_the_callers_own_addendum() {
         system_of(&requests[0])
     );
     assert!(!system_of(&requests[1]).contains("Application instructions"));
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_that_fails_is_told_to_the_extensions_and_a_close_that_works_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let model = model().await;
+    let log: Log = Arc::default();
+    let h = builder(&root, &model)
+        .extension(Recorder {
+            name: "watcher",
+            add: "X",
+            log: log.clone(),
+        })
+        .start()
+        .await
+        .unwrap();
+    let a = h.create_agent(agent("assistant")).await.unwrap();
+    let s = a.new_session().await.unwrap();
+    within(s.run("hello there")).await.unwrap();
+    within(s.close()).await.unwrap();
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("close_failed")),
+        "a close that worked is not a failure: {:?}",
+        log.lock().unwrap()
+    );
+    within(h.shutdown()).await.unwrap();
+
+    // a turn still running: the engine refuses the close ("cancel active turns first")
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let slow = MockModel::start(|_| Answer::Slow {
+        ms: 6_000,
+        then: Box::new(Answer::Text("ok".into())),
+    })
+    .await;
+    let log: Log = Arc::default();
+    let h = builder(&root, &slow)
+        .extension(Recorder {
+            name: "watcher",
+            add: "X",
+            log: log.clone(),
+        })
+        .start()
+        .await
+        .unwrap();
+    let a = h.create_agent(agent("assistant")).await.unwrap();
+    let s = a.new_session().await.unwrap();
+    let run = within(s.send("hello there")).await.unwrap();
+    for _ in 0..100 {
+        if !slow.requests().is_empty() {
+            break; // the turn is under way
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(within(s.close()).await.is_err(), "the engine refuses it");
+    let said = log.lock().unwrap().clone();
+    assert!(
+        said.iter()
+            .any(|l| l == "watcher: close_failed (agent assistant)"),
+        "{said:#?}"
+    );
+    within(s.cancel()).await.unwrap();
+    let _ = within(run.result()).await;
     within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();
 }

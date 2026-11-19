@@ -998,10 +998,15 @@ impl Session {
     /// Close the session and its workers. Cancel active turns first.
     pub async fn close(&self) -> Result<()> {
         self.extensions.before_close(&self.info()).await;
-        self.client
+        let closed = self
+            .client
             .request("agent/close", json!({"session_id": self.id()}))
             .await
-            .and_then(check_member_errors)
+            .and_then(check_member_errors);
+        if closed.is_err() {
+            self.extensions.close_failed(&self.info());
+        }
+        closed
     }
 }
 

@@ -446,11 +446,15 @@ impl Harness {
         for ext in list {
             let client = self.client.clone();
             // (a panic is a failed start like an error: the extension is left out, the harness goes on)
-            let result = AssertUnwindSafe(ext.on_start(StartContext {
-                harness: self,
-                client: &client,
-                state_dir,
-            }))
+            // (inside the future: a panic while the extension builds its future is a failed start as well)
+            let result = AssertUnwindSafe(async {
+                ext.on_start(StartContext {
+                    harness: self,
+                    client: &client,
+                    state_dir,
+                })
+                .await
+            })
             .catch_unwind()
             .await;
             match result {

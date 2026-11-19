@@ -63,14 +63,14 @@ pub(crate) enum HsError {
 }
 
 impl HsError {
-    pub(crate) fn status(&self) -> Option<u16> {
-        match self {
-            Self::Api { status, .. } => Some(*status),
-            _ => None,
-        }
-    }
     pub(crate) fn is_not_found(&self) -> bool {
-        self.status() == Some(404)
+        match self {
+            // (HeliconSearch also says it in the body, `{"code": 404, ...}`, under a 200)
+            Self::Api {
+                status, retcode, ..
+            } => *status == 404 || *retcode == Some(404),
+            _ => false,
+        }
     }
     /// The kind of a failed call, for logs: a transport kind, `unavailable` (HTTP 502/503/504), `http` or `other`.
     pub(crate) fn kind(&self) -> &'static str {
@@ -195,7 +195,12 @@ fn is_loopback(base_url: &str) -> bool {
     reqwest::Url::parse(base_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
-        .is_some_and(|h| matches!(h.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1"))
+        .is_some_and(|h| {
+            h == "localhost"
+                || h.trim_matches(|c| c == '[' || c == ']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.to_canonical().is_loopback())
+        })
 }
 
 impl HeliconClient {
@@ -353,7 +358,7 @@ impl HeliconClient {
             .and_then(Value::as_i64);
         let retmsg = body
             .as_ref()
-            .and_then(|b| b.get("retmsg"))
+            .and_then(|b| b.get("retmsg").or_else(|| b.get("message")))
             .and_then(Value::as_str)
             .map(str::to_owned);
         let detail = retmsg
@@ -391,7 +396,7 @@ impl HeliconClient {
                 self.log_failure(method, path, status, &msg);
                 return Err(HsError::Api {
                     status,
-                    retcode: None,
+                    retcode: Some(code),
                     retmsg: Some(msg.clone()),
                     message: format!("helicon-memory {method} {path} failed: code={code} {msg}"),
                 });
@@ -591,7 +596,13 @@ impl HeliconClient {
                 });
             }
         }
-        let code = raw.get("code").and_then(Value::as_i64).unwrap_or(200);
+        // (every answer of the server's carries one: `{}`, `[]` or a string is not an acceptance, and the slice
+        // must not be taken for extracted and never sent again)
+        let Some(code) = raw.get("code").and_then(Value::as_i64) else {
+            return Err(HsError::Malformed(format!(
+                "helicon-memory POST {path}: the answer has no status code, so it is not known to have been accepted"
+            )));
+        };
         let numbers = |key: &str| -> Vec<i64> {
             raw.get(key)
                 .and_then(Value::as_array)
@@ -900,7 +911,8 @@ mod tests {
     async fn a_failed_connection_does_not_name_the_server() {
         let logger = Logger::new(std::env::temp_dir().join("helicon-client-test.log"), false);
         // nothing listens here
-        let client = HeliconClient::new("http://127.0.0.1:9", "k", 1_000, logger, false);
+        let url = crate::helicon::test_support::nothing_listens();
+        let client = HeliconClient::new(&url, "k", 1_000, logger, false);
         let err = client.health().await.unwrap_err();
         let text = err.describe();
         assert!(
@@ -908,6 +920,75 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("127.0.0.1"), "{text}");
+    }
+
+    fn client_of(hs: &crate::helicon::test_support::MockHs) -> HeliconClient {
+        let logger = Logger::new(std::env::temp_dir().join("helicon-client-test.log"), false);
+        HeliconClient::new(&hs.url(), "hs_test", 2_000, logger, false)
+    }
+
+    #[tokio::test]
+    async fn a_write_answered_without_a_status_code_is_not_taken_for_accepted() {
+        use crate::helicon::test_support::{MockHs, Reply};
+        for body in [json!({}), json!([]), json!(null), json!("ok")] {
+            let answer = body.clone();
+            let hs = MockHs::start(move |_| Reply::ok(answer.clone())).await;
+            let err = client_of(&hs)
+                .add(json!({"session_id": "s", "messages": []}))
+                .await
+                .unwrap_err();
+            assert!(err.describe().contains("no status code"), "{body}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_not_found_in_the_body_is_not_found_and_a_refusal_says_why() {
+        use crate::helicon::test_support::{MockHs, Reply};
+        // HTTP 200 with `{code: 404}` is how HeliconSearch says a skill or memory does not exist
+        let hs =
+            MockHs::start(|_| Reply::ok(json!({"code": 404, "message": "no such skill"}))).await;
+        assert_eq!(
+            client_of(&hs)
+                .get_skill("0123456789abcdef0123456789abcdef")
+                .await
+                .unwrap(),
+            None
+        );
+        // a `{code, message}` refusal under an HTTP error reaches the caller with its reason
+        let hs = MockHs::start(|_| {
+            Reply::status(400, json!({"code": 400, "message": "bad request: top_k"}))
+        })
+        .await;
+        let err = client_of(&hs)
+            .query(json!({"query": "x"}), &CallOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.describe().contains("bad request: top_k"),
+            "{}",
+            err.describe()
+        );
+        assert!(!err.describe().contains("retmsg=?"), "{}", err.describe());
+    }
+
+    #[test]
+    fn every_loopback_address_is_a_loopback() {
+        for url in [
+            "http://localhost:5001",
+            "http://127.0.0.1:5001",
+            "http://127.0.0.2:5001",
+            "http://[::1]:5001",
+            "http://[::ffff:127.0.0.1]:5001",
+        ] {
+            assert!(is_loopback(url), "{url}");
+        }
+        for url in [
+            "http://10.0.0.5:5001",
+            "https://example.com",
+            "http://[2001:db8::1]:5001",
+        ] {
+            assert!(!is_loopback(url), "{url}");
+        }
     }
 
     #[test]

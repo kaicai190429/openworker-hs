@@ -87,11 +87,25 @@ impl SessionStore {
     /// The record, or a fresh one (not saved until `save`).
     pub(crate) fn get(&mut self, session_id: &str) -> &mut SessionRecord {
         if !self.cache.contains_key(session_id) {
-            let loaded = self
-                .file(session_id)
-                .and_then(|f| std::fs::read_to_string(f).ok())
-                // a damaged file starts the session's bookkeeping over: the server de-duplicates a resend
-                .and_then(|text| serde_json::from_str::<SessionRecord>(&text).ok());
+            let file = self.file(session_id).filter(|f| f.is_file());
+            let loaded = file.as_ref().and_then(|f| {
+                // a file that cannot be read or understood starts the session's bookkeeping over: the
+                // server de-duplicates a resend. That is said, since everything of it is sent again.
+                let record = std::fs::read_to_string(f)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| {
+                        serde_json::from_str::<SessionRecord>(&text).map_err(|e| e.to_string())
+                    });
+                match record {
+                    Ok(r) => Some(r),
+                    Err(why) => {
+                        self.logger.warn(&format!(
+                            "[helicon-memory] the saved progress of session {session_id} could not be used ({why}); it starts over and is sent again"
+                        ));
+                        None
+                    }
+                }
+            });
             self.cache.insert(
                 session_id.to_owned(),
                 loaded.unwrap_or_else(SessionRecord::fresh),
@@ -111,7 +125,12 @@ impl SessionStore {
         // A failure is still said, once, so a full disk or a bad permission does not go unnoticed.
         let saved = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&self.dir)?;
-            let tmp = file.with_extension(format!("{}.tmp", std::process::id()));
+            static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tmp = file.with_extension(format!(
+                "{}.{}.tmp",
+                std::process::id(),
+                SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             let text = serde_json::to_string(rec).map_err(std::io::Error::other)?;
             write_private(&tmp, text.as_bytes())?;
             std::fs::rename(&tmp, &file)

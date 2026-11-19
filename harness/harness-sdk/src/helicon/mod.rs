@@ -25,7 +25,7 @@ mod config_file;
 mod filters;
 mod guidance;
 mod history;
-#[cfg(test)]
+#[cfg(all(test, feature = "helicon-live-test"))]
 mod live_test;
 mod log;
 mod memory_context;
@@ -42,7 +42,10 @@ mod transcript;
 mod util;
 
 use crate::{
-    extension::{BoxFuture, DecorateContext, Extension, SessionInfo, StartContext, TurnContext},
+    extension::{
+        BoxFuture, DecorateContext, Extension, SessionInfo, StartContext, TurnContext,
+        MAX_ADDENDUM_BYTES,
+    },
     Agent, Error, Notification, Result,
 };
 use bridge::{format_bridge_context, freeze_bridge_by, BridgeTurn, BRIDGE_PROTOCOL};
@@ -71,8 +74,6 @@ use util::{cut_bytes, now_ms, BoundedMap};
 const TAG: &str = "[helicon-memory]";
 /// What ends a cut addendum: the last `<relevant-memories>` envelope is kept closed.
 const ENVELOPE_END: &str = "\n</relevant-memories>";
-/// The engine accepts at most this much application addendum per turn (UTF-8 bytes).
-const MAX_ADDENDUM_BYTES: usize = 32_000;
 const SUBMISSION_CACHE_MAX: usize = 256;
 /// `close()` holds the application for the memory work no longer than the extraction wait plus this.
 const CLOSE_MARGIN_MS: u64 = 15_000;
@@ -432,6 +433,23 @@ impl Inner {
         }
     }
 
+    /// `Session::close` failed after `session_closing` had let go of the session: it is open still, so it
+    /// is followed again (its last turn is archived, and it is ended when it is closed or goes quiet).
+    fn close_failed(&self, session: &SessionInfo) {
+        if self.allows(&session.agent) {
+            self.touch(&session.session_id);
+        } else {
+            self.attached
+                .lock()
+                .unwrap()
+                .insert(session.session_id.clone());
+            self.excluded
+                .lock()
+                .unwrap()
+                .insert(session.session_id.clone());
+        }
+    }
+
     fn on_notification(self: &Arc<Self>, notification: Notification) {
         match notification {
             Notification::Event(e) => {
@@ -457,8 +475,10 @@ impl Inner {
                 }
             }
             Notification::Recovered { session_id, .. } => {
-                // (workers of a team are attached by the SDK too, but only the lead is captured)
-                if self.attached.lock().unwrap().contains(&session_id) {
+                // Only a session this extension follows is looked at again: the workers of a team are
+                // attached by the SDK too, and a session it has not seen before is only looked at when it
+                // takes a turn (a recovered engine must not back-fill every old session that was resumed).
+                if self.known.lock().unwrap().contains(&session_id) {
                     self.resync(Some(&session_id));
                 }
             }
@@ -526,9 +546,14 @@ impl Inner {
         let Some(capture) = self.capture() else {
             return;
         };
-        if self.store.lock().unwrap().get(session_id).ended {
-            return;
-        }
+        let activity = {
+            let mut store = self.store.lock().unwrap();
+            let rec = store.get(session_id);
+            if rec.ended {
+                return;
+            }
+            rec.last_active
+        };
         if !capture.flush(session_id, wait_for_extraction_ms).await {
             self.logger.warn(&format!(
                 "{TAG} session {session_id} is not ended on HeliconSearch yet: its history is not fully archived"
@@ -567,8 +592,15 @@ impl Inner {
         };
         {
             let mut store = self.store.lock().unwrap();
-            store.get(session_id).ended = true;
-            store.save(session_id);
+            // (a turn that came in while this went on has the session in use again: it is not over)
+            if store.get(session_id).last_active > activity {
+                self.logger.info(&format!(
+                    "{TAG} session {session_id} was used again while it was being ended; it stays open"
+                ));
+            } else {
+                store.get(session_id).ended = true;
+                store.save(session_id);
+            }
         }
         let status = answer["status"].as_str().unwrap_or("?");
         let memory_id = answer["memory_id"].as_str().filter(|s| !s.is_empty());
@@ -687,7 +719,6 @@ impl Inner {
             Recent,
             Orphan,
         }
-        let live: HashSet<String> = self.known_sessions().into_iter().collect();
         let saved = self.store.lock().unwrap().list();
         let (mut ended, mut tried) = (0, 0);
         for id in saved {
@@ -695,7 +726,9 @@ impl Inner {
             if ended >= ORPHANS_PER_START || tried >= 3 * ORPHANS_PER_START {
                 break;
             }
-            if live.contains(&id) {
+            // (looked at now, not when the start began: the application may have resumed it since, and a
+            // session in use is not an orphan)
+            if self.known.lock().unwrap().contains(&id) {
                 continue;
             }
             let kind = {
@@ -723,8 +756,11 @@ impl Inner {
             if self.store.lock().unwrap().get(&id).ended {
                 ended += 1;
             }
-            if let Some(capture) = self.capture() {
-                capture.release(&id);
+            // (not one the application took up in the meantime)
+            if !self.known.lock().unwrap().contains(&id) {
+                if let Some(capture) = self.capture() {
+                    capture.release(&id);
+                }
             }
         }
     }
@@ -893,6 +929,10 @@ impl Extension for HeliconExtension {
 
     fn before_close<'a>(&'a self, session: &'a SessionInfo) -> BoxFuture<'a, ()> {
         Box::pin(async move { self.inner.session_closing(session).await })
+    }
+
+    fn on_close_failed(&self, session: &SessionInfo) {
+        self.inner.close_failed(session);
     }
 
     fn on_shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
@@ -1086,7 +1126,7 @@ mod tests {
         // nothing listens on this port
         let cfg = Arc::new(
             MemoryConfig::parse(
-                &json!({"baseUrl": "http://127.0.0.1:9", "apiKey": "k", "sessionBridge": false, "timeoutMs": 1000}),
+                &json!({"baseUrl": test_support::nothing_listens(), "apiKey": "k", "sessionBridge": false, "timeoutMs": 1000}),
                 &|_| None,
             )
             .unwrap(),
@@ -1424,6 +1464,118 @@ mod tests {
         inner.touch("s1");
         assert_eq!(saved()["ended"], false);
         assert!(saved()["lastActive"].as_u64().unwrap() > first);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_does_not_back_fill_a_session_that_was_only_resumed() {
+        use crate::Notification;
+        let hs = MockHs::start(capture_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({"sessionBridge": false}));
+        with_capture(
+            &ext,
+            vec![(0, json!({"role": "user", "content": "I prefer dark mode"}))],
+        );
+        // resumed by the application, never taken a turn in since this extension exists
+        ext.on_session_attached(&session("old-1"));
+        ext.inner.on_notification(Notification::Recovered {
+            session_id: "old-1".into(),
+            snapshot: json!({}),
+        });
+        settle().await;
+        assert_eq!(turns_sent(&hs), 0, "{:?}", hs.requests());
+    }
+
+    #[tokio::test]
+    async fn a_close_the_engine_refused_leaves_the_session_followed_and_its_last_turn_archived() {
+        use crate::Notification;
+        let hs = MockHs::start(|req| match req.path.as_str() {
+            "/v1/memory/session/end" => Reply::ok(json!({"status": "closed", "memory_id": "m"})),
+            _ => capture_hs()(req),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(
+            &hs,
+            dir.path(),
+            json!({"autoRecall": false, "sessionBridge": false}),
+        );
+        let history = with_capture(
+            &ext,
+            vec![(0, json!({"role": "user", "content": "I prefer dark mode"}))],
+        );
+        let s = session("s1");
+        ext.on_session_created(&s);
+        ext.before_close(&s).await; // the extension lets go of it ...
+        assert_eq!(turns_sent(&hs), 1);
+        history
+            .items
+            .lock()
+            .unwrap()
+            .push((1, json!({"role": "user", "content": "and I like tea"})));
+        let done = || {
+            Notification::Event(crate::Event {
+                event_id: 1,
+                session_id: "s1".into(),
+                turn_id: None,
+                kind: "turn_completed".into(),
+                data: json!({}),
+            })
+        };
+        ext.inner.on_notification(done());
+        settle().await;
+        assert_eq!(turns_sent(&hs), 1, "closed: its events are not followed");
+        // ... and the engine did not close it after all
+        ext.on_close_failed(&s);
+        assert!(!ext.inner.store.lock().unwrap().get("s1").ended);
+        ext.inner.on_notification(done());
+        settle().await;
+        assert_eq!(
+            turns_sent(&hs),
+            2,
+            "followed again: the new turn is archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_used_again_while_its_end_is_under_way_is_not_marked_ended() {
+        let hs = MockHs::start(|req| match req.path.as_str() {
+            "/v1/memory/session/end" => Reply::ok(json!({"status": "closed", "memory_id": "m"}))
+                .after(Duration::from_millis(800)),
+            _ => capture_hs()(req),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(
+            &hs,
+            dir.path(),
+            json!({"autoRecall": false, "sessionBridge": false}),
+        );
+        with_capture(
+            &ext,
+            vec![(0, json!({"role": "user", "content": "I prefer dark mode"}))],
+        );
+        let inner = &ext.inner;
+        ext.on_session_created(&session("s1"));
+        let ending = inner.end_session("s1", 0);
+        // the end is on its way to the server (slow to answer) when a turn comes in
+        for _ in 0..100 {
+            if hs
+                .requests()
+                .iter()
+                .any(|r| r.path == "/v1/memory/session/end")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        inner.touch("s1");
+        ending.await;
+        assert!(
+            !inner.store.lock().unwrap().get("s1").ended,
+            "it was used again, so it is not over"
+        );
     }
 
     #[tokio::test]

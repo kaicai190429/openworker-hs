@@ -16,6 +16,16 @@ use tokio::{
     net::TcpListener,
 };
 
+/// The URL of a port that nothing listens on (one that was free a moment ago), for "the server is down".
+pub(crate) fn nothing_listens() -> String {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!("http://127.0.0.1:{port}")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Request {
     pub method: String,
@@ -186,12 +196,18 @@ use crate::helicon::history::{HistoryPage, HistorySource};
 /// A history the test controls, in place of the engine's.
 pub(crate) struct FakeHistory {
     pub items: Mutex<Vec<(usize, Value)>>,
+    /// At most this many items per read (the rest is `more`), like a history longer than one read covers.
+    pub per_read: Mutex<Option<usize>>,
+    /// How many times the history was read (one per capture cycle).
+    pub reads: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeHistory {
     pub(crate) fn new(items: Vec<(usize, Value)>) -> Self {
         Self {
             items: Mutex::new(items),
+            per_read: Mutex::new(None),
+            reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -203,10 +219,26 @@ impl HistorySource for FakeHistory {
         after: usize,
     ) -> BoxFuture<'a, Result<HistoryPage, String>> {
         Box::pin(async move {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let items = self.items.lock().unwrap();
+            let mut wanted: Vec<(usize, Value)> =
+                items.iter().filter(|(i, _)| *i >= after).cloned().collect();
+            let more = match *self.per_read.lock().unwrap() {
+                Some(n) if wanted.len() > n => {
+                    wanted.truncate(n);
+                    true
+                }
+                _ => false,
+            };
+            let next = if more {
+                wanted.last().map_or(after, |(i, _)| i + 1)
+            } else {
+                items.len().max(after)
+            };
             Ok(HistoryPage {
-                items: items.iter().filter(|(i, _)| *i >= after).cloned().collect(),
-                next: items.len().max(after),
+                items: wanted,
+                next,
+                more,
             })
         })
     }

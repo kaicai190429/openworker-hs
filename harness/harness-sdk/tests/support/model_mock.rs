@@ -16,6 +16,11 @@ pub enum Answer {
         name: String,
         arguments: Value,
     },
+    /// The same answer after this many milliseconds (a turn that is still running meanwhile).
+    Slow {
+        ms: u64,
+        then: Box<Answer>,
+    },
 }
 
 pub struct MockModel {
@@ -26,6 +31,7 @@ pub struct MockModel {
 fn sse(answer: &Answer, call: usize) -> String {
     let frame = |v: Value| format!("data: {v}\n\n");
     match answer {
+        Answer::Slow { then, .. } => sse(then, call),
         Answer::Text(text) => {
             frame(
                 json!({"id": "fixture", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
@@ -90,7 +96,12 @@ impl MockModel {
                         .unwrap_or(Value::Null);
                     log.lock().unwrap().push(body.clone());
                     let call = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let payload = sse(&respond(&body), call);
+                    let mut answer = respond(&body);
+                    if let Answer::Slow { ms, then } = answer {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        answer = *then;
+                    }
+                    let payload = sse(&answer, call);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                         payload.len()
