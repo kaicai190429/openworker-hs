@@ -3,6 +3,7 @@
 //! busy retries and journal streaming all happen in the host, so this file is
 //! what every language SDK needs to reproduce, and no more.
 use super::team::Team;
+use crate::extension::{Extensions, SessionInfo};
 use crate::{ApprovalDecision, Error, Event, HarnessClient, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -414,6 +415,7 @@ impl RunStream {
 pub struct Session {
     client: HarnessClient,
     reference: SessionRef,
+    extensions: Extensions,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -548,7 +550,10 @@ impl Session {
         if let Some(compaction) = options.compaction {
             parameters["compaction"] = json!(compaction);
         }
-        if let Some(addendum) = options.instruction_addendum {
+        if let Some(addendum) = self
+            .addendum(&id, text, options.instruction_addendum)
+            .await
+        {
             parameters["instruction_addendum"] = json!(addendum);
         }
         if let Some(output) = options.output {
@@ -624,6 +629,9 @@ impl Session {
         if let Some(limits) = limits {
             parameters["limits"] = json!(limits);
         }
+        if let Some(addendum) = self.addendum(id, text, None).await {
+            parameters["instruction_addendum"] = json!(addendum);
+        }
         let started = self.client.request("session/send", parameters).await?;
         Ok(Run {
             session: self.clone(),
@@ -639,13 +647,15 @@ impl Session {
     }
     pub(crate) async fn create(
         client: HarnessClient,
+        extensions: Extensions,
         agent: &str,
         workspace: &Path,
     ) -> Result<Self> {
-        Self::create_with_model(client, agent, workspace, None).await
+        Self::create_with_model(client, extensions, agent, workspace, None).await
     }
     pub(crate) async fn create_with_model(
         client: HarnessClient,
+        extensions: Extensions,
         agent: &str,
         workspace: &Path,
         model: Option<crate::ModelChoice>,
@@ -654,9 +664,13 @@ impl Session {
         if let Some(model) = model {
             options["model"] = json!(model);
         }
-        Self::create_options(client, options).await
+        Self::create_options(client, extensions, options).await
     }
-    pub(crate) async fn create_options(client: HarnessClient, options: Value) -> Result<Self> {
+    pub(crate) async fn create_options(
+        client: HarnessClient,
+        extensions: Extensions,
+        options: Value,
+    ) -> Result<Self> {
         if options.get("integrations").is_some()
             && !client.info()["capabilities"]["integrations"].is_object()
         {
@@ -688,11 +702,21 @@ impl Session {
         let created = client.request("agent/session", options).await?;
         let reference: SessionRef = serde_json::from_value(created["session"].clone())
             .map_err(|_| Error::Remote("Malformed agent/session result".into()))?;
-        Self::open(client, reference).await
+        let session = Self::open(client, extensions, reference).await?;
+        session.extensions.created(&session.info());
+        Ok(session)
     }
 
-    pub(crate) async fn open(client: HarnessClient, reference: SessionRef) -> Result<Self> {
-        let session = Self { client, reference };
+    pub(crate) async fn open(
+        client: HarnessClient,
+        extensions: Extensions,
+        reference: SessionRef,
+    ) -> Result<Self> {
+        let session = Self {
+            client,
+            reference,
+            extensions,
+        };
         // Attach every member at its current cursor so child-restart recovery
         // covers them without replaying history.
         for sid in session.member_ids() {
@@ -701,7 +725,26 @@ impl Session {
                 .unwrap_or(0);
             session.client.attach(&sid, cursor).await?;
         }
+        session.extensions.attached(&session.info());
         Ok(session)
+    }
+
+    fn info(&self) -> SessionInfo {
+        SessionInfo {
+            session_id: self.reference.session_id.clone(),
+            agent: self.reference.agent.clone(),
+        }
+    }
+
+    /// The trusted addendum to send with a turn: the caller's own, as extended by the attached
+    /// extensions. Only when the host supports turn context; otherwise the caller's own.
+    async fn addendum(&self, submission_id: &str, text: &str, own: Option<String>) -> Option<String> {
+        if self.extensions.is_empty() || self.client.info()["capabilities"]["turn_context"] != true {
+            return own;
+        }
+        self.extensions
+            .before_send(&self.info(), submission_id, text, own)
+            .await
     }
 
     pub fn id(&self) -> &str {
@@ -790,11 +833,15 @@ impl Session {
                 "Update the host to configure application guidance".into(),
             ));
         }
+        let text = user_text(&input);
         let parts = input.upload(&self.client, self.id()).await?;
         let id = options
             .submission_id
             .unwrap_or_else(|| openworker_runtime::id("sub"));
-        let value=self.client.request("session/send",json!({"session_id":self.id(),"submission_id":id,"input":{"content":parts},"limits":options.limits,"safety":options.safety,"instruction_addendum":options.instruction_addendum,"auto_approver_context":options.auto_approver_context,"compaction":options.compaction,"output":options.output})).await?;
+        let addendum = self
+            .addendum(&id, &text, options.instruction_addendum.clone())
+            .await;
+        let value=self.client.request("session/send",json!({"session_id":self.id(),"submission_id":id,"input":{"content":parts},"limits":options.limits,"safety":options.safety,"instruction_addendum":addendum,"auto_approver_context":options.auto_approver_context,"compaction":options.compaction,"output":options.output})).await?;
         Ok(Run {
             session: self.clone(),
             submission: id,
@@ -802,14 +849,14 @@ impl Session {
         })
     }
     pub async fn run_input(&self, input: crate::UserInput) -> Result<RunResult> {
+        let text = user_text(&input);
         let parts = input.upload(&self.client, self.id()).await?;
         let id = openworker_runtime::id("sub");
-        self.client
-            .request(
-                "run/start",
-                json!({"session_id":self.id(),"submission_id":id,"content":parts}),
-            )
-            .await?;
+        let mut parameters = json!({"session_id":self.id(),"submission_id":id,"content":parts});
+        if let Some(addendum) = self.addendum(&id, &text, None).await {
+            parameters["instruction_addendum"] = json!(addendum);
+        }
+        self.client.request("run/start", parameters).await?;
         self.wait(Some(&id)).await
     }
     pub async fn run_with_attachments(
@@ -822,15 +869,14 @@ impl Session {
         self.run_input(crate::UserInput::new(content)).await
     }
     pub async fn run_input_streamed(&self, input: crate::UserInput) -> Result<RunStream> {
+        let text = user_text(&input);
         let parts = input.upload(&self.client, self.id()).await?;
         let id = openworker_runtime::id("sub");
-        let started = self
-            .client
-            .request(
-                "run/start",
-                json!({"session_id":self.id(),"submission_id":id,"content":parts}),
-            )
-            .await?;
+        let mut parameters = json!({"session_id":self.id(),"submission_id":id,"content":parts});
+        if let Some(addendum) = self.addendum(&id, &text, None).await {
+            parameters["instruction_addendum"] = json!(addendum);
+        }
+        let started = self.client.request("run/start", parameters).await?;
         Ok(self.spawn(
             Some(id),
             started["cursors"].as_object().cloned().unwrap_or_default(),
@@ -852,12 +898,12 @@ impl Session {
     }
 
     async fn start(&self, submission_id: &str, input: &str) -> Result<Value> {
-        self.client
-            .request(
-                "run/start",
-                json!({"session_id": self.id(), "submission_id": submission_id, "text": input}),
-            )
-            .await
+        let mut parameters =
+            json!({"session_id": self.id(), "submission_id": submission_id, "text": input});
+        if let Some(addendum) = self.addendum(submission_id, input, None).await {
+            parameters["instruction_addendum"] = json!(addendum);
+        }
+        self.client.request("run/start", parameters).await
     }
     async fn wait(&self, submission: Option<&str>) -> Result<RunResult> {
         loop {
@@ -948,6 +994,7 @@ impl Session {
     }
     /// Close the session and its workers. Cancel active turns first.
     pub async fn close(&self) -> Result<()> {
+        self.extensions.before_close(&self.info()).await;
         self.client
             .request("agent/close", json!({"session_id": self.id()}))
             .await
@@ -1157,4 +1204,17 @@ mod tests {
             Some("req_fixture")
         );
     }
+}
+
+/// The text parts of a user input, in order (attachments contribute nothing).
+fn user_text(input: &crate::UserInput) -> String {
+    input
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            crate::InputContent::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

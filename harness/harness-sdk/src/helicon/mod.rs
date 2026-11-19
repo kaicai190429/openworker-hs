@@ -1,0 +1,1022 @@
+//! Long-term memory for harness agents, served by HeliconSearch.
+//!
+//! It is an [`Extension`](crate::extension::Extension) that is attached to a harness when a
+//! configuration file asks for it (see `config_file`); without such a file nothing here runs and the
+//! SDK behaves exactly as before. It does not change what an application calls — it listens at the
+//! points the SDK offers extensions:
+//!
+//! | point | what happens |
+//! |---|---|
+//! | harness start | register the memory tools, listen to the journal |
+//! | agent registered | memory tools and their usage rules are added; the engine's built-in memory is turned off |
+//! | before a message is sent | the memories relevant to it are recalled into that turn's `instruction_addendum` (the engine's per-turn field, not stored in history) |
+//! | journal `turn_completed` | the new history is archived and facts are extracted (`capture`) |
+//! | `Session::close` | pending work is sent, then the session is ended on HeliconSearch (which writes its summary) |
+//! | harness shutdown | what is still pending is flushed |
+//!
+//! Memory only: media search is not part of this extension (the options that configure it are accepted
+//! in the file and ignored).
+mod bridge;
+mod budget;
+mod capture;
+mod client;
+mod config;
+mod config_file;
+mod filters;
+mod guidance;
+mod history;
+#[cfg(test)]
+mod live_test;
+mod log;
+mod memory_context;
+mod recall;
+mod session_store;
+mod source_ref;
+mod strategy;
+#[cfg(test)]
+mod test_support;
+mod tools;
+mod transcript;
+mod util;
+
+use crate::{
+    extension::{BoxFuture, DecorateContext, Extension, SessionInfo, StartContext, TurnContext},
+    Agent, Error, Notification, Result,
+};
+use bridge::{format_bridge_context, freeze_bridge_by, BridgeTurn, BRIDGE_PROTOCOL};
+use budget::{HookBudget, RecallBudgets};
+use capture::{to_helicon_session_id, CaptureDeps, CaptureEngine};
+use client::{CallOptions, HeliconClient};
+use config::MemoryConfig;
+use config_file::ConfigLoad;
+use futures_util::future::{BoxFuture as SharedBox, FutureExt, Shared};
+use guidance::{memory_guidance, MODEL_TOOL_PREFIX, TOOL_NAMESPACE};
+use log::Logger;
+use recall::{perform_auto_recall, RecallParams};
+use serde_json::json;
+use session_store::SessionStore;
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
+use tokio::task::JoinHandle;
+use tools::Tools;
+use util::{cut_bytes, now_ms, BoundedMap};
+
+const TAG: &str = "[helicon-memory]";
+/// The engine accepts at most this much application addendum per turn (UTF-8 bytes).
+const MAX_ADDENDUM_BYTES: usize = 32_000;
+const SUBMISSION_CACHE_MAX: usize = 256;
+/// `close()` holds the application for the memory work no longer than the extraction wait plus this.
+const CLOSE_MARGIN_MS: u64 = 15_000;
+/// `shutdown()` holds the application no longer than this for the memory work.
+const SHUTDOWN_BUDGET_MS: u64 = 45_000;
+/// Sessions of earlier runs ended per start.
+const ORPHANS_PER_START: usize = 10;
+
+/// The extension for the configuration found for this state directory, if there is one that is on.
+/// Never fails: a configuration that cannot be used is reported on stderr and memory stays off.
+pub(crate) fn from_state_dir(state_dir: &Path) -> Option<Arc<dyn Extension>> {
+    let env = |name: &str| std::env::var(name).ok();
+    match config_file::load(state_dir, &config_file::resource_dirs(), &env) {
+        ConfigLoad::Absent | ConfigLoad::Disabled => None,
+        ConfigLoad::Invalid { path, reason } => {
+            eprintln!(
+                "openworker: helicon-memory is off: {}: {reason}",
+                path.display()
+            );
+            None
+        }
+        ConfigLoad::Enabled(cfg) => Some(Arc::new(HeliconExtension {
+            inner: Inner::new(Arc::new(*cfg), state_dir),
+        })),
+    }
+}
+
+struct HeliconExtension {
+    inner: Arc<Inner>,
+}
+
+type Ending = Shared<SharedBox<'static, ()>>;
+
+struct Inner {
+    cfg: Arc<MemoryConfig>,
+    logger: Logger,
+    client: HeliconClient,
+    store: Arc<Mutex<SessionStore>>,
+    budgets: RecallBudgets,
+    tools: Arc<Tools>,
+    /// Set when the harness is up (it needs the protocol client to read history).
+    capture: OnceLock<Arc<CaptureEngine>>,
+    /// The qualified names an agent lists in `tools` to get the memory tools.
+    tool_names: Vec<String>,
+    guidance: String,
+    /// The recall made for a submission, so a retry of it gets the same text.
+    recalled: Mutex<BoundedMap<String, Option<String>>>,
+    /// Sessions that went through the SDK's `Session`, and have not been closed.
+    attached: Mutex<HashSet<String>>,
+    /// Sessions this process created, resumed or took a turn in, and has not closed: what shutdown and
+    /// idling look at.
+    known: Mutex<HashSet<String>>,
+    /// Sessions of agents that do not get memory: nothing of them is recalled, archived or ended.
+    excluded: Mutex<HashSet<String>>,
+    ending: Mutex<HashMap<String, Ending>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Inner {
+    fn new(cfg: Arc<MemoryConfig>, state_dir: &Path) -> Arc<Self> {
+        let root: PathBuf = state_dir.join("helicon-memory");
+        let logger = Logger::new(root.join("adapter.log"), cfg.debug);
+        let client = HeliconClient::new(
+            &cfg.base_url,
+            &cfg.api_key,
+            cfg.timeout_ms,
+            logger.clone(),
+            cfg.debug,
+        );
+        let budgets = RecallBudgets::new(&cfg.base_url, cfg.hook_timeout_ms, logger.clone());
+        let short_names = tools::tool_names(&cfg);
+        Arc::new(Self {
+            tools: Tools::new(cfg.clone(), client.clone(), logger.clone(), budgets.clone()),
+            tool_names: short_names
+                .iter()
+                .map(|n| format!("{TOOL_NAMESPACE}.{n}"))
+                .collect(),
+            guidance: memory_guidance(&cfg, &short_names),
+            store: Arc::new(Mutex::new(SessionStore::new(root))),
+            capture: OnceLock::new(),
+            recalled: Mutex::new(BoundedMap::new(SUBMISSION_CACHE_MAX)),
+            attached: Mutex::default(),
+            known: Mutex::default(),
+            excluded: Mutex::default(),
+            ending: Mutex::default(),
+            tasks: Mutex::default(),
+            cfg,
+            logger,
+            client,
+            budgets,
+        })
+    }
+
+    /// Whether an agent of this id gets memory (`agents` in the configuration; absent: all).
+    fn allows(&self, agent: &str) -> bool {
+        self.cfg
+            .agents
+            .as_ref()
+            .is_none_or(|agents| agents.iter().any(|a| a == agent))
+    }
+
+    fn capture(&self) -> Option<&Arc<CaptureEngine>> {
+        self.capture.get()
+    }
+
+    // ── recall ──────────────────────────────────────────────────────────────
+
+    /// The cross-session bridge for a session's first turn, within the turn's deadline.
+    fn fetch_bridge(&self, budget: &HookBudget) -> SharedBox<'static, BridgeTurn> {
+        let (cfg, client) = (self.cfg.clone(), self.client.clone());
+        let deadline = budget.deadline_ms;
+        async move {
+            let limits = [
+                (
+                    "episodic_limit",
+                    cfg.session_bridge_episodic_limit.to_string(),
+                ),
+                (
+                    "pinned_min_importance",
+                    cfg.session_bridge_pinned_min_importance.to_string(),
+                ),
+                (
+                    "pinned_min_recall",
+                    cfg.session_bridge_pinned_min_recall.to_string(),
+                ),
+                ("pinned_top_k", cfg.session_bridge_pinned_top_k.to_string()),
+                (
+                    "procedure_limit",
+                    cfg.session_bridge_procedure_limit.to_string(),
+                ),
+            ];
+            let bridge = match client
+                .get_session_bridge(
+                    &cfg.agent_id,
+                    &cfg.project_id,
+                    &limits,
+                    &CallOptions::deadline(deadline),
+                )
+                .await
+            {
+                Ok(b) => b,
+                Err(err) => return BridgeTurn::Omitted(err.describe()),
+            };
+            let protocol = bridge["protocol"].as_str().unwrap_or("");
+            if protocol != BRIDGE_PROTOCOL {
+                return BridgeTurn::Omitted(format!("protocol {protocol}"));
+            }
+            let rendering = format_bridge_context(&bridge, cfg.session_bridge_token_budget);
+            if rendering.text.is_empty() {
+                BridgeTurn::Omitted("empty".into())
+            } else {
+                BridgeTurn::Injected(rendering)
+            }
+        }
+        .boxed()
+    }
+
+    /// What to add to this turn's `instruction_addendum`: the memories recalled for the user's
+    /// message, and — on a new session's first turn only — the cross-session bridge. The caller's own
+    /// addendum is kept first. A retry of the same submission gets the same text. Never fails.
+    async fn prepare_turn(&self, turn: &TurnContext<'_>) -> Option<String> {
+        let own_addendum = turn.addendum.map(str::to_owned);
+        let session_id = &turn.session.session_id;
+        if self.excluded.lock().unwrap().contains(session_id) {
+            return own_addendum;
+        }
+        self.touch(session_id);
+        let key = format!("{session_id}:{}", turn.submission_id);
+        let cached = self.recalled.lock().unwrap().get(&key).cloned();
+        let ours = match cached {
+            Some(ours) => ours,
+            None => {
+                let ours = self.recall_for(session_id, turn.text).await;
+                self.recalled.lock().unwrap().insert(key, ours.clone());
+                ours
+            }
+        };
+        let Some(ours) = ours else {
+            return own_addendum;
+        };
+        let own = own_addendum.clone().unwrap_or_default();
+        let separator = if own.is_empty() { 0 } else { 2 };
+        let room = MAX_ADDENDUM_BYTES.saturating_sub(own.len() + separator);
+        let fitted = cut_bytes(&ours, room);
+        if fitted.is_empty() {
+            return own_addendum;
+        }
+        Some(if own.is_empty() {
+            fitted.to_owned()
+        } else {
+            format!("{own}\n\n{fitted}")
+        })
+    }
+
+    async fn recall_for(&self, session_id: &str, text: &str) -> Option<String> {
+        let cfg = &self.cfg;
+        let want_bridge =
+            cfg.session_bridge && self.store.lock().unwrap().get(session_id).bridge_pending;
+        if !cfg.auto_recall && !want_bridge {
+            return None;
+        }
+        let budget = HookBudget::new(cfg.hook_timeout_ms, self.budgets.current());
+        let bridge: SharedBox<'static, BridgeTurn> = if want_bridge {
+            self.fetch_bridge(&budget)
+        } else {
+            async { BridgeTurn::Omitted("not the first turn".into()) }.boxed()
+        };
+        let frozen = freeze_bridge_by(bridge, budget.compose_by_ms());
+        let recall = perform_auto_recall(RecallParams {
+            client: &self.client,
+            cfg,
+            prompt: text,
+            logger: &self.logger,
+            budget: &budget,
+            budgets: &self.budgets,
+            session_key: session_id,
+            trigger: None,
+            bridge: Some(frozen.clone()),
+        });
+        let (recall, bridge) = tokio::join!(recall, frozen.clone());
+        if want_bridge {
+            // the bridge is for the opening of a session only: whether or not it made it this time,
+            // it is not tried again
+            let mut store = self.store.lock().unwrap();
+            store.get(session_id).bridge_pending = false;
+            store.save(session_id);
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if let BridgeTurn::Injected(r) = &bridge {
+            parts.push(r.text.clone());
+        }
+        if let Some(block) = recall.prepend_context {
+            parts.push(block);
+        }
+        let joined = parts.join("\n\n");
+        self.logger.info(&format!(
+            "{TAG} turn session={session_id} recall={} bridge={} chars={} elapsedMs={}",
+            recall.report.outcome,
+            match &bridge {
+                BridgeTurn::Omitted(why) => why.as_str(),
+                BridgeTurn::Injected(_) => "injected",
+            },
+            joined.chars().count(),
+            budget.elapsed_ms()
+        ));
+        (!parts.is_empty()).then_some(joined)
+    }
+
+    // ── session lifecycle ───────────────────────────────────────────────────
+
+    /// A session was just created by this process: its first turn gets the bridge.
+    fn session_created(&self, session: &SessionInfo) {
+        let id = &session.session_id;
+        self.attached.lock().unwrap().insert(id.clone());
+        if !self.allows(&session.agent) {
+            self.excluded.lock().unwrap().insert(id.clone());
+            return;
+        }
+        self.known.lock().unwrap().insert(id.clone());
+        let mut store = self.store.lock().unwrap();
+        let rec = store.get(id);
+        rec.bridge_pending = true;
+        rec.last_active = now_ms();
+        store.save(id);
+    }
+
+    /// A session was attached (created or resumed): whatever its history holds beyond the saved
+    /// cursors is sent. A session this extension has not seen before is only looked at when it takes a
+    /// turn: attaching a list of old sessions must not archive (and end) all of their histories.
+    fn session_attached(self: &Arc<Self>, session: &SessionInfo) {
+        let id = &session.session_id;
+        self.attached.lock().unwrap().insert(id.clone());
+        if !self.allows(&session.agent) {
+            self.excluded.lock().unwrap().insert(id.clone());
+            return;
+        }
+        if self.store.lock().unwrap().has(id) {
+            self.known.lock().unwrap().insert(id.clone());
+            if let Some(capture) = self.capture() {
+                capture.schedule(id);
+            }
+        }
+    }
+
+    /// The session is in use: it is not idle, and if it had been ended it is open again.
+    fn touch(&self, session_id: &str) {
+        self.known.lock().unwrap().insert(session_id.to_owned());
+        let mut store = self.store.lock().unwrap();
+        let rec = store.get(session_id);
+        let now = now_ms();
+        if !rec.ended && now.saturating_sub(rec.last_active) < 5_000 {
+            return; // saving on every event is not needed
+        }
+        rec.last_active = now;
+        rec.ended = false;
+        store.save(session_id);
+    }
+
+    fn on_notification(self: &Arc<Self>, notification: Notification) {
+        match notification {
+            Notification::Event(e) if e.kind == "turn_completed" => {
+                let id = &e.session_id;
+                if self.excluded.lock().unwrap().contains(id)
+                    || !self.attached.lock().unwrap().contains(id)
+                {
+                    return;
+                }
+                self.touch(id); // also makes the session known
+                if let Some(capture) = self.capture() {
+                    capture.schedule(id);
+                }
+            }
+            Notification::Recovered { session_id, .. } => self.resync(Some(&session_id)),
+            Notification::Gap => self.resync(None),
+            _ => {}
+        }
+    }
+
+    /// Events may have been missed: look at the history of one session, or of every session in use.
+    fn resync(self: &Arc<Self>, only: Option<&str>) {
+        let Some(capture) = self.capture() else {
+            return;
+        };
+        let ids = match only {
+            Some(id) => vec![id.to_owned()],
+            None => self.known_sessions(),
+        };
+        for id in ids {
+            if !self.excluded.lock().unwrap().contains(&id) {
+                capture.schedule(&id);
+            }
+        }
+    }
+
+    fn known_sessions(&self) -> Vec<String> {
+        let mut ids: HashSet<String> = self.known.lock().unwrap().clone();
+        if let Some(capture) = self.capture() {
+            ids.extend(capture.sessions());
+        }
+        ids.into_iter().collect()
+    }
+
+    /// Sends what is pending for the session and tells HeliconSearch it is over, which makes it write
+    /// the session's summary and finish extracting. Once per stretch of activity; never fails. The
+    /// returned future is shared: callers that want the result await it, the others spawn it.
+    fn end_session(self: &Arc<Self>, session_id: &str, wait_for_extraction_ms: u64) -> Ending {
+        let mut ending = self.ending.lock().unwrap();
+        if let Some(running) = ending.get(session_id) {
+            return running.clone();
+        }
+        let inner = self.clone();
+        let id = session_id.to_owned();
+        let work: Ending = async move {
+            inner.end_session_work(&id, wait_for_extraction_ms).await;
+            inner.ending.lock().unwrap().remove(&id);
+        }
+        .boxed()
+        .shared();
+        ending.insert(session_id.to_owned(), work.clone());
+        work
+    }
+
+    fn end_session_detached(self: &Arc<Self>, session_id: &str, wait_for_extraction_ms: u64) {
+        let work = self.end_session(session_id, wait_for_extraction_ms);
+        tokio::spawn(work);
+    }
+
+    async fn end_session_work(&self, session_id: &str, wait_for_extraction_ms: u64) {
+        let Some(capture) = self.capture() else {
+            return;
+        };
+        if self.store.lock().unwrap().get(session_id).ended {
+            return;
+        }
+        capture.flush(session_id, wait_for_extraction_ms).await;
+        let archived = self.store.lock().unwrap().get(session_id).archive_next;
+        if archived == 0 {
+            // nothing was ever said: there is no HeliconSearch session to end
+            let mut store = self.store.lock().unwrap();
+            store.get(session_id).ended = true;
+            store.save(session_id);
+            return;
+        }
+        let hs_id = to_helicon_session_id(session_id);
+        let cfg = &self.cfg;
+        let answer = match self
+            .client
+            .session_end(json!({
+                "session_id": hs_id,
+                "agent_id": cfg.agent_id,
+                "project_id": cfg.project_id,
+                "source_refs": [{"type": "session", "ref_id": hs_id}],
+                "message_count": archived,
+            }))
+            .await
+        {
+            Ok(a) => a,
+            Err(err) => {
+                self.logger.warn(&format!(
+                    "{TAG} ending session {session_id} on HeliconSearch failed: {}",
+                    err.describe()
+                ));
+                return;
+            }
+        };
+        {
+            let mut store = self.store.lock().unwrap();
+            store.get(session_id).ended = true;
+            store.save(session_id);
+        }
+        let status = answer["status"].as_str().unwrap_or("?");
+        let memory_id = answer["memory_id"].as_str().filter(|s| !s.is_empty());
+        self.logger.info(&format!(
+            "{TAG} session end status={status} memory_id={} session={hs_id}",
+            memory_id.unwrap_or("none")
+        ));
+        if status == "closed" && memory_id.is_none() {
+            // the summary is made on the server: ask for it, without waiting
+            let (client, logger) = (self.client.clone(), self.logger.clone());
+            let request = json!({"session_id": hs_id, "agent_id": cfg.agent_id, "project_id": cfg.project_id});
+            tokio::spawn(async move {
+                match client.session_summary(request).await {
+                    Ok(s) => logger.info(&format!(
+                        "{TAG} session summary status={} memory_id={}",
+                        s["status"].as_str().unwrap_or("?"),
+                        s["memory_id"].as_str().unwrap_or("none")
+                    )),
+                    Err(err) => {
+                        logger.warn(&format!("{TAG} session summary failed: {}", err.describe()))
+                    }
+                }
+            });
+        }
+    }
+
+    /// `Session::close`: sends what is pending and ends the session on HeliconSearch. Bounded; never fails.
+    async fn session_closing(self: &Arc<Self>, session: &SessionInfo) {
+        let id = &session.session_id;
+        self.attached.lock().unwrap().remove(id);
+        if self.excluded.lock().unwrap().remove(id) {
+            return;
+        }
+        if self.cfg.sync_transcript {
+            let wait = self.cfg.close_wait_ms;
+            let _ = tokio::time::timeout(
+                Duration::from_millis(wait + CLOSE_MARGIN_MS),
+                self.end_session(id, wait),
+            )
+            .await;
+        }
+        if let Some(capture) = self.capture() {
+            capture.release(id);
+        }
+        self.known.lock().unwrap().remove(id);
+    }
+
+    /// Ends the sessions nobody has touched for `idle_end_ms`.
+    fn sweep_idle(self: &Arc<Self>) {
+        let limit = self.cfg.idle_end_ms;
+        if !self.cfg.sync_transcript || limit == 0 {
+            return;
+        }
+        let now = now_ms();
+        for id in self.known_sessions() {
+            let idle = {
+                let mut store = self.store.lock().unwrap();
+                let rec = store.get(&id);
+                !rec.ended && now.saturating_sub(rec.last_active) >= limit
+            };
+            if idle {
+                self.end_session_detached(&id, 0);
+            }
+        }
+    }
+
+    /// Sessions an earlier run left open (it was killed, or never shut down): archived turns of theirs
+    /// that were never ended are ended now, a few per start so HeliconSearch's summary queue is not flooded.
+    async fn end_orphans(self: &Arc<Self>) {
+        let limit = self.cfg.idle_end_ms;
+        if !self.cfg.sync_transcript || limit == 0 {
+            return;
+        }
+        let live: HashSet<String> = self.known_sessions().into_iter().collect();
+        let saved = self.store.lock().unwrap().list();
+        let mut ended = 0;
+        for id in saved {
+            if ended >= ORPHANS_PER_START {
+                break;
+            }
+            if live.contains(&id) {
+                continue;
+            }
+            let orphan = {
+                let mut store = self.store.lock().unwrap();
+                let rec = store.get(&id);
+                let skip = rec.ended
+                    || rec.archive_next == 0
+                    || now_ms().saturating_sub(rec.last_active) < limit;
+                if skip {
+                    store.forget(&id);
+                }
+                !skip
+            };
+            if !orphan {
+                continue;
+            }
+            ended += 1;
+            self.end_session(&id, 0).await;
+            if let Some(capture) = self.capture() {
+                capture.release(&id);
+            }
+        }
+    }
+
+    /// `Harness::shutdown`: ends every session this process worked on and has not closed, so
+    /// HeliconSearch summarises them (an application that exits without closing its sessions gets that
+    /// anyway). Bounded.
+    async fn shutdown(self: &Arc<Self>) {
+        for task in self.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        let Some(capture) = self.capture().cloned() else {
+            return;
+        };
+        let end = self.cfg.end_on_shutdown && self.cfg.sync_transcript;
+        let work = self.known_sessions().into_iter().map(|id| {
+            let inner = self.clone();
+            let capture = capture.clone();
+            async move {
+                if end {
+                    inner.end_session(&id, 0).await;
+                } else {
+                    capture.flush(&id, 0).await;
+                }
+            }
+        });
+        let _ = tokio::time::timeout(
+            Duration::from_millis(SHUTDOWN_BUDGET_MS),
+            futures_util::future::join_all(work),
+        )
+        .await;
+    }
+}
+
+impl Extension for HeliconExtension {
+    fn name(&self) -> &str {
+        "helicon-memory"
+    }
+
+    fn on_start<'a>(&'a self, ctx: StartContext<'a>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let inner = &self.inner;
+            let caps = &ctx.client.info()["capabilities"];
+            if caps["application_callbacks"] != true || caps["turn_context"] != true {
+                return Err(Error::Setup(
+                    "this harness build lacks application callbacks or turn context".into(),
+                ));
+            }
+            let capture = CaptureEngine::new(CaptureDeps {
+                cfg: inner.cfg.clone(),
+                client: inner.client.clone(),
+                store: inner.store.clone(),
+                history: Arc::new(ctx.client.clone()),
+                logger: inner.logger.clone(),
+                own_tool_prefix: MODEL_TOOL_PREFIX,
+            });
+            let _ = inner.capture.set(capture);
+            ctx.harness
+                .register_tools(TOOL_NAMESPACE, tools::build_tools(&inner.tools))
+                .await?;
+
+            let mut tasks = inner.tasks.lock().unwrap();
+            // the journal: a completed turn schedules a capture cycle
+            let mut events = ctx.client.subscribe();
+            let listener = inner.clone();
+            tasks.push(tokio::spawn(async move {
+                use tokio::sync::broadcast::error::RecvError;
+                loop {
+                    match events.recv().await {
+                        Ok(n) => listener.on_notification(n),
+                        // events were dropped: look at the history of every session in use
+                        Err(RecvError::Lagged(_)) => listener.resync(None),
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            }));
+            // the server's recall budgets, and a first sign of whether it is there; nothing waits for it
+            let probe = inner.clone();
+            tasks.push(tokio::spawn(async move {
+                match probe.client.health().await {
+                    Ok(h) => probe.budgets.learn_from_health(Some(&h)),
+                    Err(err) => {
+                        probe.budgets.learn_from_health(None);
+                        probe.logger.warn(&format!(
+                            "{TAG} HeliconSearch not reachable at {}: {}",
+                            probe.cfg.base_url,
+                            err.describe()
+                        ));
+                    }
+                }
+            }));
+            if inner.cfg.idle_end_ms > 0 && inner.cfg.sync_transcript {
+                let period = (inner.cfg.idle_end_ms / 2).clamp(1_000, 60_000);
+                let sweeper = inner.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(period));
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        sweeper.sweep_idle();
+                    }
+                }));
+                let orphans = inner.clone();
+                tasks.push(tokio::spawn(async move { orphans.end_orphans().await }));
+            }
+            inner.logger.info(&format!(
+                "{TAG} adapter on: {} agent={} mode={}",
+                inner.cfg.base_url,
+                inner.cfg.agent_id,
+                strategy::name(inner.cfg.capture_mode)
+            ));
+            Ok(())
+        })
+    }
+
+    fn decorate_agent(&self, agent: &mut Agent, ctx: &DecorateContext) {
+        let inner = &self.inner;
+        if !inner.allows(agent.id()) {
+            return;
+        }
+        // the engine's own memory (and its scope, which only makes sense with it) gives way to this one
+        if inner.cfg.replace_builtin_memory {
+            agent.memory = false;
+            agent.memory_scope = None;
+            for sub in &mut agent.subagents {
+                sub.memory = false;
+                sub.memory_scope = None;
+            }
+        }
+        // an agent the host compiles while it opens cannot name a tool registered after that
+        if !ctx.tools_registered {
+            return;
+        }
+        for name in &inner.tool_names {
+            if !agent.tools.contains(name) {
+                agent.tools.push(name.clone());
+            }
+        }
+        if !inner.guidance.is_empty() && !agent.instructions.contains(&inner.guidance) {
+            agent.instructions = format!("{}\n\n{}", agent.instructions, inner.guidance);
+        }
+    }
+
+    fn on_session_created(&self, session: &SessionInfo) {
+        self.inner.session_created(session);
+    }
+
+    fn on_session_attached(&self, session: &SessionInfo) {
+        self.inner.session_attached(session);
+    }
+
+    fn before_send<'a>(&'a self, turn: TurnContext<'a>) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { self.inner.prepare_turn(&turn).await })
+    }
+
+    fn before_close<'a>(&'a self, session: &'a SessionInfo) -> BoxFuture<'a, ()> {
+        Box::pin(async move { self.inner.session_closing(session).await })
+    }
+
+    fn on_shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async move { self.inner.shutdown().await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::{MockHs, Reply};
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn extension(hs: &MockHs, dir: &Path, extra: serde_json::Value) -> HeliconExtension {
+        let mut raw =
+            json!({"baseUrl": hs.url(), "apiKey": "hs_test", "agentId": "a1", "projectId": "p1"});
+        for (k, v) in extra.as_object().unwrap() {
+            raw[k] = v.clone();
+        }
+        let cfg = Arc::new(MemoryConfig::parse(&raw, &|_| None).unwrap());
+        HeliconExtension {
+            inner: Inner::new(cfg, dir),
+        }
+    }
+
+    fn session(id: &str) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            agent: "lead".into(),
+        }
+    }
+
+    fn recall_hs() -> impl Fn(&test_support::Request) -> Reply + Send + Sync + 'static {
+        |req| match req.path.as_str() {
+            "/v1/memory/query" => {
+                let text = "- likes tea\n";
+                Reply::ok(json!({
+                    "grounded_facts": [{"id": "pkg:1", "claim": "likes tea", "score": 0.9, "source_memory_ids": [ID]}],
+                    "prompt_text": text,
+                    "prompt_blocks": {"protocol": "blocks.v1", "blocks": [
+                        {"text": text, "ref": {"type": "memory", "memory_id": ID, "version": "v1", "extras": []}}
+                    ]},
+                }))
+            }
+            p if p.starts_with("/v1/memory/session_bridge") => Reply::ok(json!({
+                "protocol": "bridge.v2", "is_empty": false, "conflict_limit": 3, "conflicts": [],
+                "recent_episodes": [], "category_summaries": [], "procedures": [],
+                "pinned_semantics": [{"id": "pin1", "text": "lives in Oslo", "category": "fact", "version": "v1", "conflict_ids": []}],
+            })),
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    async fn turn(
+        ext: &HeliconExtension,
+        session: &SessionInfo,
+        submission: &str,
+        text: &str,
+        addendum: Option<&str>,
+    ) -> Option<String> {
+        ext.before_send(TurnContext {
+            session,
+            submission_id: submission,
+            text,
+            addendum,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_first_turn_gets_the_bridge_and_the_recall_later_turns_only_the_recall() {
+        let hs = MockHs::start(recall_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({}));
+        let s = session("s1");
+        ext.on_session_created(&s);
+
+        let first = turn(&ext, &s, "sub-1", "what do I like to drink?", None)
+            .await
+            .unwrap();
+        assert!(first.starts_with("## 跨会话记忆\n"), "{first}");
+        assert!(first.contains("- [fact] lives in Oslo"));
+        assert!(first.contains("<relevant-memories>"));
+        assert!(first.contains("- likes tea"));
+        assert!(
+            first.contains(&format!("- {ID} — likes tea")),
+            "the id index"
+        );
+
+        let second = turn(&ext, &s, "sub-2", "and what else do I like?", None)
+            .await
+            .unwrap();
+        assert!(
+            !second.contains("跨会话记忆\n**"),
+            "no bridge on a later turn: {second}"
+        );
+        assert!(second.starts_with("<relevant-memories>"));
+        let bridges = hs
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/v1/memory/session_bridge"))
+            .count();
+        assert_eq!(bridges, 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_of_a_submission_gets_the_same_text_without_asking_again() {
+        let hs = MockHs::start(recall_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({"sessionBridge": false}));
+        let s = session("s1");
+        ext.on_session_created(&s);
+        let a = turn(&ext, &s, "sub-1", "what do I like to drink?", None).await;
+        let queries = hs.requests().len();
+        let b = turn(&ext, &s, "sub-1", "what do I like to drink?", None).await;
+        assert_eq!(a, b);
+        assert_eq!(hs.requests().len(), queries);
+    }
+
+    #[tokio::test]
+    async fn the_callers_addendum_comes_first_and_the_total_stays_within_the_engines_limit() {
+        let hs = MockHs::start(recall_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({"sessionBridge": false}));
+        let s = session("s1");
+        let text = turn(&ext, &s, "a", "what do I like to drink?", Some("Be brief."))
+            .await
+            .unwrap();
+        assert!(text.starts_with("Be brief.\n\n<relevant-memories>"));
+        // the caller's own text alone fills the room: it is returned as it is
+        let big = "x".repeat(MAX_ADDENDUM_BYTES);
+        let kept = turn(&ext, &s, "b", "what do I like to drink?", Some(&big))
+            .await
+            .unwrap();
+        assert_eq!(kept, big);
+        let mostly = "y".repeat(MAX_ADDENDUM_BYTES - 100);
+        let cut = turn(&ext, &s, "c", "what do I like to drink?", Some(&mostly))
+            .await
+            .unwrap();
+        assert!(cut.len() <= MAX_ADDENDUM_BYTES && cut.len() > mostly.len());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_leaves_the_turn_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        // nothing listens on this port
+        let cfg = Arc::new(
+            MemoryConfig::parse(
+                &json!({"baseUrl": "http://127.0.0.1:9", "apiKey": "k", "sessionBridge": false, "timeoutMs": 1000}),
+                &|_| None,
+            )
+            .unwrap(),
+        );
+        let ext = HeliconExtension {
+            inner: Inner::new(cfg, dir.path()),
+        };
+        let s = session("s1");
+        assert_eq!(
+            turn(&ext, &s, "a", "what do I like to drink?", Some("mine"))
+                .await
+                .as_deref(),
+            Some("mine")
+        );
+        assert_eq!(
+            turn(&ext, &s, "b", "what do I like to drink?", None).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_the_config_leaves_out_get_nothing() {
+        let hs = MockHs::start(recall_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({"agents": ["lead"]}));
+        let other = SessionInfo {
+            session_id: "s2".into(),
+            agent: "other".into(),
+        };
+        ext.on_session_created(&other);
+        assert_eq!(
+            turn(&ext, &other, "a", "what do I like to drink?", Some("mine"))
+                .await
+                .as_deref(),
+            Some("mine")
+        );
+        assert!(hs.requests().is_empty());
+        let mut agent = Agent::new("other").instructions("x").memory(true);
+        ext.decorate_agent(
+            &mut agent,
+            &DecorateContext {
+                tools_registered: true,
+            },
+        );
+        assert!(agent.memory && agent.tool_names().is_empty());
+    }
+
+    #[test]
+    fn decorating_an_agent_swaps_the_builtin_memory_for_the_tools_and_their_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(
+            MemoryConfig::parse(
+                &json!({"baseUrl": "http://127.0.0.1:5001", "apiKey": "k"}),
+                &|_| None,
+            )
+            .unwrap(),
+        );
+        let ext = HeliconExtension {
+            inner: Inner::new(cfg, dir.path()),
+        };
+        let sub = Agent::new("sub").instructions("s").memory(true);
+        let mut agent = Agent::new("lead")
+            .instructions("Be helpful.")
+            .memory(true)
+            .memory_scope("shared")
+            .tool("other.tool");
+        agent.subagents.push(sub);
+        ext.decorate_agent(
+            &mut agent,
+            &DecorateContext {
+                tools_registered: true,
+            },
+        );
+        assert!(!agent.memory && agent.memory_scope.is_none() && !agent.subagents[0].memory);
+        assert_eq!(
+            agent.tool_names(),
+            [
+                "other.tool",
+                "helicon.memory_recall",
+                "helicon.memory_get",
+                "helicon.memory_forget",
+                "helicon.skill_get"
+            ]
+        );
+        assert!(agent
+            .instructions_text()
+            .starts_with("Be helpful.\n\n## Long-term Memory\n"));
+        // deciding twice adds nothing more
+        let before = agent.instructions_text().to_owned();
+        ext.decorate_agent(
+            &mut agent,
+            &DecorateContext {
+                tools_registered: true,
+            },
+        );
+        assert_eq!(agent.instructions_text(), before);
+        assert_eq!(agent.tool_names().len(), 5);
+        // an agent the host compiles before tools exist only gives up the built-in memory
+        let mut early = Agent::new("early").instructions("E").memory(true);
+        ext.decorate_agent(
+            &mut early,
+            &DecorateContext {
+                tools_registered: false,
+            },
+        );
+        assert!(!early.memory && early.tool_names().is_empty() && early.instructions_text() == "E");
+    }
+
+    #[test]
+    fn keeping_the_builtin_memory_is_an_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(MemoryConfig::parse(&json!({"baseUrl": "http://127.0.0.1:5001", "apiKey": "k", "replaceBuiltinMemory": false}), &|_| None).unwrap());
+        let ext = HeliconExtension {
+            inner: Inner::new(cfg, dir.path()),
+        };
+        let mut agent = Agent::new("lead").instructions("x").memory(true);
+        ext.decorate_agent(
+            &mut agent,
+            &DecorateContext {
+                tools_registered: true,
+            },
+        );
+        assert!(agent.memory);
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_with_nothing_said_ends_nothing() {
+        let hs = MockHs::start(|req| panic!("unexpected {}", req.path)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({}));
+        // closing before the harness is up (no capture engine) must not fail or call out
+        ext.before_close(&session("s1")).await;
+        assert!(hs.requests().is_empty());
+    }
+}

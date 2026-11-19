@@ -2,12 +2,14 @@
 //! data (`HostConfig.agents`); the host compiles and runs them.
 use super::session::{Session, SessionRef};
 use super::Agent;
+use crate::extension::{DecorateContext, Extension, Extensions, StartContext};
 use crate::{
     ClientOptions, Error, HarnessClient, HostConfig, HostProcessConfig, RestartPolicy, Result,
     Sandbox, Storage, TelemetryConfig, ToolRegistry,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct HarnessBuilder {
     providers: Vec<crate::ModelProvider>,
@@ -22,9 +24,16 @@ pub struct HarnessBuilder {
     telemetry: Option<TelemetryConfig>,
     recording: Option<crate::RecordingConfig>,
     options: ClientOptions,
+    extensions: Vec<Arc<dyn Extension>>,
 }
 
 impl HarnessBuilder {
+    /// Attach an [`Extension`]: it is told about sessions and may add trusted text to turns.
+    /// Extensions configured by files (such as HeliconSearch memory) are attached on their own.
+    pub fn extension(mut self, extension: impl Extension) -> Self {
+        self.extensions.push(Arc::new(extension));
+        self
+    }
     pub fn inherit_env(mut self, name: impl Into<String>) -> Self {
         self.desktop.inherit_env.push(name.into());
         self
@@ -167,12 +176,31 @@ impl HarnessBuilder {
         self
     }
 
-    fn prepare(&self, managed: bool) -> Result<HostConfig> {
-        let state_dir = self
-            .state_dir
+    fn resolved_state_dir(&self) -> Result<PathBuf> {
+        self.state_dir
             .clone()
             .map(Ok)
-            .unwrap_or_else(crate::desktop::default_state_dir)?;
+            .unwrap_or_else(crate::desktop::default_state_dir)
+    }
+
+    /// The extensions this harness starts with: the ones given to the builder plus those a configuration
+    /// file in the state directory asks for. Agents given to the builder are decorated here, before the
+    /// host compiles them.
+    fn collect_extensions(&mut self) -> Result<(Vec<Arc<dyn Extension>>, PathBuf)> {
+        let state_dir = self.resolved_state_dir()?;
+        let mut extensions = std::mem::take(&mut self.extensions);
+        if let Some(ext) = crate::helicon::from_state_dir(&state_dir) {
+            extensions.push(ext);
+        }
+        let set = Extensions::new(extensions.clone());
+        for agent in &mut self.agents {
+            set.decorate(agent, &DecorateContext { tools_registered: false });
+        }
+        Ok((extensions, state_dir))
+    }
+
+    fn prepare(&self, managed: bool) -> Result<HostConfig> {
+        let state_dir = self.resolved_state_dir()?;
         let tool_free = super::compile::flatten(&self.agents)?
             .iter()
             .all(|(_, (agent, _))| agent.tools.is_empty());
@@ -210,10 +238,11 @@ impl HarnessBuilder {
     }
 
     /// Run the engine inside this process (your Tokio runtime, your tools).
-    pub async fn embedded(self) -> Result<Harness> {
+    pub async fn embedded(mut self) -> Result<Harness> {
+        let (extensions, state_dir) = self.collect_extensions()?;
         let host = self.prepare(false)?;
         let client = HarnessClient::embedded_host(host, self.registry, self.options).await?;
-        let harness = Harness::connect(client).await?;
+        let mut harness = Harness::connect(client).await?;
         if self
             .agents
             .iter()
@@ -231,16 +260,18 @@ impl HarnessBuilder {
                 return Err(error);
             }
         }
+        harness.start_extensions(extensions, &state_dir).await;
         Ok(harness)
     }
 
     /// Run the engine in an SDK-owned child process with bounded restarts.
-    pub async fn managed(self, program: PathBuf, restart: RestartPolicy) -> Result<Harness> {
+    pub async fn managed(mut self, program: PathBuf, restart: RestartPolicy) -> Result<Harness> {
         if !self.desktop.integration_registry.catalog().is_empty() {
             return Err(Error::Setup(
                 "Register custom integration crates in the managed host executable".into(),
             ));
         }
+        let (extensions, state_dir) = self.collect_extensions()?;
         let host = self.prepare(true)?;
         let client = HarnessClient::managed_host(
             HostProcessConfig {
@@ -251,7 +282,7 @@ impl HarnessBuilder {
             self.options,
         )
         .await?;
-        let harness = Harness::connect(client).await?;
+        let mut harness = Harness::connect(client).await?;
         if self
             .agents
             .iter()
@@ -269,6 +300,7 @@ impl HarnessBuilder {
                 return Err(error);
             }
         }
+        harness.start_extensions(extensions, &state_dir).await;
         Ok(harness)
     }
 }
@@ -281,6 +313,7 @@ pub struct Harness {
     application_tools: std::sync::Arc<crate::application_tools::ApplicationTools>,
     provider_auth: std::sync::Arc<crate::provider_callbacks::ClientAuth>,
     safety_callbacks: std::sync::Arc<crate::safety_callbacks::ClientSafety>,
+    extensions: Extensions,
 }
 
 impl Harness {
@@ -290,7 +323,9 @@ impl Harness {
         target.connect().await
     }
     /// Register an agent after startup. Exact repeats are safe; changes need a new ID.
-    pub async fn create_agent(&self, definition: Agent) -> Result<AgentHandle> {
+    pub async fn create_agent(&self, mut definition: Agent) -> Result<AgentHandle> {
+        self.extensions
+            .decorate(&mut definition, &DecorateContext { tools_registered: true });
         for a in std::iter::once(&definition).chain(definition.subagents.iter()) {
             if a.standalone_subagents.as_ref().is_some_and(|c| c.enabled)
                 && self.client.info()["capabilities"]["standalone_subagents"] != true
@@ -326,6 +361,7 @@ impl Harness {
         Ok(AgentHandle {
             client: self.client.clone(),
             id,
+            extensions: self.extensions.clone(),
         })
     }
     /// `state_dir` holds durable state and generated agent bundles. `runner`
@@ -347,6 +383,7 @@ impl Harness {
             telemetry: None,
             recording: None,
             options: ClientOptions::default(),
+            extensions: vec![],
         }
     }
     /// Wrap any connected client whose host supports agent runs, e.g. one
@@ -371,7 +408,24 @@ impl Harness {
             application_tools,
             provider_auth,
             safety_callbacks,
+            extensions: Extensions::default(),
         })
+    }
+    /// Start the extensions of a freshly connected harness. One that fails to start is left out: an
+    /// extension must not stop an application.
+    async fn start_extensions(&mut self, list: Vec<Arc<dyn Extension>>, state_dir: &Path) {
+        let mut started = Vec::new();
+        for ext in list {
+            let client = self.client.clone();
+            let result = ext
+                .on_start(StartContext { harness: self, client: &client, state_dir })
+                .await;
+            match result {
+                Ok(()) => started.push(ext),
+                Err(error) => eprintln!("openworker: extension {} is off: {error}", ext.name()),
+            }
+        }
+        self.extensions = Extensions::new(started);
     }
     /// The underlying protocol client, for anything this layer does not wrap.
     pub fn observability(&self) -> crate::recording::Observability {
@@ -487,15 +541,16 @@ impl Harness {
     /// Start a session of `agent` in `workspace`. An agent with subagents also
     /// gets one worker session per subagent and a team joining them.
     pub async fn session(&self, agent: &str, workspace: impl AsRef<Path>) -> Result<Session> {
-        Session::create(self.client.clone(), agent, workspace.as_ref()).await
+        Session::create(self.client.clone(), self.extensions.clone(), agent, workspace.as_ref()).await
     }
     /// Reattach to a session from a [`SessionRef`] you persisted. Only the
     /// session ID is needed; the host knows its team.
     pub async fn resume(&self, reference: SessionRef) -> Result<Session> {
-        Session::open(self.client.clone(), reference).await
+        Session::open(self.client.clone(), self.extensions.clone(), reference).await
     }
     /// Deterministic cleanup. Await before dropping your Tokio runtime.
     pub async fn shutdown(&self) -> Result<()> {
+        self.extensions.shutdown().await;
         self.provider_auth.stop();
         self.safety_callbacks.stop();
         self.application_tools.stop();
@@ -508,22 +563,23 @@ impl Harness {
 pub struct AgentHandle {
     client: HarnessClient,
     id: String,
+    extensions: Extensions,
 }
 impl AgentHandle {
     pub fn id(&self) -> &str {
         &self.id
     }
     pub async fn new_session(&self) -> Result<Session> {
-        Session::create_options(self.client.clone(), json!({"agent":self.id})).await
+        Session::create_options(self.client.clone(), self.extensions.clone(), json!({"agent":self.id})).await
     }
     pub async fn new_session_in(&self, workspace: impl AsRef<Path>) -> Result<Session> {
-        Session::create(self.client.clone(), &self.id, workspace.as_ref()).await
+        Session::create(self.client.clone(), self.extensions.clone(), &self.id, workspace.as_ref()).await
     }
     pub async fn new_session_with(&self, options: crate::SessionOptions) -> Result<Session> {
         let mut value = serde_json::to_value(options)
             .map_err(|_| Error::InvalidInput("Invalid session options".into()))?;
         value["agent"] = json!(self.id);
-        Session::create_options(self.client.clone(), value).await
+        Session::create_options(self.client.clone(), self.extensions.clone(), value).await
     }
     pub async fn new_session_with_model(
         &self,
@@ -532,6 +588,7 @@ impl AgentHandle {
     ) -> Result<Session> {
         Session::create_with_model(
             self.client.clone(),
+            self.extensions.clone(),
             &self.id,
             workspace.as_ref(),
             Some(model),
@@ -550,6 +607,6 @@ impl AgentHandle {
                 "Session identity does not match this agent".into(),
             ));
         }
-        Session::open(self.client.clone(), reference).await
+        Session::open(self.client.clone(), self.extensions.clone(), reference).await
     }
 }

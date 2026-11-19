@@ -228,6 +228,14 @@ impl Agent {
         self.builtin_tools = Some(tools);
         self
     }
+    /// The instructions as they stand (extensions that decorate an agent append to them).
+    pub fn instructions_text(&self) -> &str {
+        &self.instructions
+    }
+    /// The qualified tool names the agent lists.
+    pub fn tool_names(&self) -> &[String] {
+        &self.tools
+    }
     pub fn id(&self) -> &str {
         &self.id
     }

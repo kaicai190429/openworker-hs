@@ -1,6 +1,8 @@
 //! Development Rust API for the same engine embedded or over managed private stdio.
 //! No request is automatically resubmitted after transport failure.
 pub mod agents;
+pub mod extension;
+mod helicon;
 #[cfg(feature = "evaluation-export")]
 mod evaluation_export;
 mod instrumentation;

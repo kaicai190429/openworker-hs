@@ -47,6 +47,8 @@ tokio-util = "0.7"
 zeroize = "1"
 futures-util = "0.3"
 async-stream = "0.3"
+regex = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
