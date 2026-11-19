@@ -3,11 +3,18 @@
 //! agent definition before it is registered. Nothing here changes what an application calls: with no
 //! extension attached every hook is skipped and the SDK behaves as it always did.
 //!
-//! Hooks are advisory. A hook that fails or is slow must not fail a turn, so the SDK never turns an
-//! extension's problem into an application error (`on_start` is the one exception: a failing start
-//! drops that extension and the harness starts without it).
+//! Hooks are advisory. The SDK never turns an extension's problem into an application error: a hook
+//! that panics is ignored (and reported on stderr), and `on_start` failing drops that extension and the
+//! harness starts without it. A slow hook delays the call it hooks into, so a hook bounds its own time.
 use crate::{Agent, Harness, HarnessClient, Result};
-use std::{future::Future, path::Path, pin::Pin, sync::Arc};
+use futures_util::FutureExt;
+use std::{
+    future::Future,
+    panic::{catch_unwind, AssertUnwindSafe},
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -93,17 +100,20 @@ impl Extensions {
     }
     pub(crate) fn decorate(&self, agent: &mut Agent, ctx: &DecorateContext) {
         for ext in self.0.iter() {
-            ext.decorate_agent(agent, ctx);
+            let done = catch_unwind(AssertUnwindSafe(|| ext.decorate_agent(agent, ctx)));
+            ignored(ext.as_ref(), "decorate_agent", done.is_err());
         }
     }
     pub(crate) fn created(&self, session: &SessionInfo) {
         for ext in self.0.iter() {
-            ext.on_session_created(session);
+            let done = catch_unwind(AssertUnwindSafe(|| ext.on_session_created(session)));
+            ignored(ext.as_ref(), "on_session_created", done.is_err());
         }
     }
     pub(crate) fn attached(&self, session: &SessionInfo) {
         for ext in self.0.iter() {
-            ext.on_session_attached(session);
+            let done = catch_unwind(AssertUnwindSafe(|| ext.on_session_attached(session)));
+            ignored(ext.as_ref(), "on_session_attached", done.is_err());
         }
     }
     /// The addendum for a turn after every extension has had its say, in the order they were added.
@@ -116,25 +126,116 @@ impl Extensions {
     ) -> Option<String> {
         let mut current = addendum;
         for ext in self.0.iter() {
-            current = ext
-                .before_send(TurnContext {
-                    session,
-                    submission_id,
-                    text,
-                    addendum: current.as_deref(),
-                })
-                .await;
+            let turn = TurnContext {
+                session,
+                submission_id,
+                text,
+                addendum: current.as_deref(),
+            };
+            // a panicking extension leaves the addendum as the one before it made it
+            match AssertUnwindSafe(ext.before_send(turn)).catch_unwind().await {
+                Ok(next) => current = next,
+                Err(_) => ignored(ext.as_ref(), "before_send", true),
+            }
         }
         current
     }
     pub(crate) async fn before_close(&self, session: &SessionInfo) {
         for ext in self.0.iter() {
-            ext.before_close(session).await;
+            let done = AssertUnwindSafe(ext.before_close(session))
+                .catch_unwind()
+                .await;
+            ignored(ext.as_ref(), "before_close", done.is_err());
         }
     }
     pub(crate) async fn shutdown(&self) {
         for ext in self.0.iter() {
-            ext.on_shutdown().await;
+            let done = AssertUnwindSafe(ext.on_shutdown()).catch_unwind().await;
+            ignored(ext.as_ref(), "on_shutdown", done.is_err());
         }
+    }
+}
+
+/// Says so on stderr when an extension's hook panicked (the panic is otherwise swallowed).
+fn ignored(ext: &dyn Extension, hook: &str, panicked: bool) {
+    if panicked {
+        eprintln!(
+            "openworker: extension {} panicked in {hook}; ignored",
+            ext.name()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Panicky;
+    impl Extension for Panicky {
+        fn name(&self) -> &str {
+            "panicky"
+        }
+        fn decorate_agent(&self, _: &mut Agent, _: &DecorateContext) {
+            panic!("decorate");
+        }
+        fn on_session_created(&self, _: &SessionInfo) {
+            panic!("created");
+        }
+        fn before_send<'a>(&'a self, _: TurnContext<'a>) -> BoxFuture<'a, Option<String>> {
+            Box::pin(async { panic!("before_send") })
+        }
+        fn before_close<'a>(&'a self, _: &'a SessionInfo) -> BoxFuture<'a, ()> {
+            Box::pin(async { panic!("before_close") })
+        }
+    }
+
+    struct Adds(&'static str);
+    impl Extension for Adds {
+        fn name(&self) -> &str {
+            "adds"
+        }
+        fn before_send<'a>(&'a self, turn: TurnContext<'a>) -> BoxFuture<'a, Option<String>> {
+            Box::pin(async move {
+                Some(match turn.addendum {
+                    Some(own) => format!("{own}+{}", self.0),
+                    None => self.0.to_owned(),
+                })
+            })
+        }
+    }
+
+    fn session() -> SessionInfo {
+        SessionInfo {
+            session_id: "s".into(),
+            agent: "a".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_extension_is_ignored_and_the_others_still_run_in_order() {
+        let set = Extensions::new(vec![
+            Arc::new(Adds("a")),
+            Arc::new(Panicky),
+            Arc::new(Adds("b")),
+        ]);
+        let s = session();
+        assert_eq!(
+            set.before_send(&s, "sub", "hi", Some("own".into()))
+                .await
+                .as_deref(),
+            Some("own+a+b")
+        );
+        set.created(&s);
+        set.attached(&s);
+        set.before_close(&s).await;
+        let mut agent = Agent::new("x").instructions("i");
+        set.decorate(
+            &mut agent,
+            &DecorateContext {
+                tools_registered: true,
+            },
+        );
+        assert_eq!(agent.instructions_text(), "i");
+        assert!(Extensions::default().is_empty());
     }
 }

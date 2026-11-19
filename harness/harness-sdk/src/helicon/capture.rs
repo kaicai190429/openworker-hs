@@ -60,6 +60,8 @@ struct Live {
     extraction_lock: Arc<tokio::sync::Mutex<()>>,
     /// How many extractions are queued or running.
     pending: watch::Sender<usize>,
+    /// The last cycle left nothing of the history unarchived (and did not fail).
+    caught_up: AtomicBool,
 }
 
 impl Live {
@@ -71,6 +73,7 @@ impl Live {
             state: Mutex::new(LiveState::default()),
             extraction_lock: Arc::new(tokio::sync::Mutex::new(())),
             pending: watch::channel(0).0,
+            caught_up: AtomicBool::new(true),
         }
     }
 }
@@ -134,16 +137,26 @@ impl CaptureEngine {
         let _running = live.run_lock.lock().await;
         // (a caller that queued behind a runner finds its dirty flag already taken)
         while live.dirty.swap(false, Ordering::SeqCst) {
-            if let Err(err) = self.cycle(session_id, &live).await {
-                self.d.logger.warn(&format!(
-                    "{TAG} capture cycle failed session={session_id}: {err}"
-                ));
+            match self.cycle(session_id, &live).await {
+                Ok(caught_up) => live.caught_up.store(caught_up, Ordering::SeqCst),
+                Err(err) => {
+                    live.caught_up.store(false, Ordering::SeqCst);
+                    self.d.logger.warn(&format!(
+                        "{TAG} capture cycle failed session={session_id}: {err}"
+                    ));
+                }
             }
         }
     }
 
     /// Archives everything pending now and waits (bounded) for the extraction of it.
-    pub(crate) async fn flush(&self, session_id: &str, wait_for_extraction_ms: u64) {
+    ///
+    /// `true` when the archive is up to date with the history; `false` when something could not be
+    /// sent (HeliconSearch down, a turn refused): the session is then not over yet.
+    pub(crate) async fn flush(&self, session_id: &str, wait_for_extraction_ms: u64) -> bool {
+        if !self.d.cfg.auto_capture {
+            return true; // nothing is archived, so nothing is behind
+        }
         let live = self.live_of(session_id);
         if let Some(timer) = live.timer.lock().unwrap().take() {
             timer.abort();
@@ -156,6 +169,7 @@ impl CaptureEngine {
             };
             let _ = tokio::time::timeout(Duration::from_millis(wait_for_extraction_ms), idle).await;
         }
+        live.caught_up.load(Ordering::SeqCst)
     }
 
     /// Every session this process has captured for (shutdown flushes them).
@@ -201,7 +215,8 @@ impl CaptureEngine {
         Ok(())
     }
 
-    async fn cycle(&self, session_id: &str, live: &Arc<Live>) -> Result<(), String> {
+    /// One look at the history: `Ok(true)` when all of it is archived afterwards.
+    async fn cycle(&self, session_id: &str, live: &Arc<Live>) -> Result<bool, String> {
         let d = &self.d;
         let (extract_from, from) = {
             let mut store = d.store.lock().unwrap();
@@ -213,7 +228,7 @@ impl CaptureEngine {
         };
         let page = d.history.read(session_id, from).await?;
         if page.next <= from {
-            return Ok(());
+            return Ok(true);
         }
         let messages = {
             let mut state = live.state.lock().unwrap();
@@ -321,7 +336,7 @@ impl CaptureEngine {
             let slice: Vec<Option<Value>> = messages.into_iter().take(upto).collect();
             self.spawn_extraction(session_id, live.clone(), slice, extract_from, upto);
         }
-        Ok(())
+        Ok(upto >= page.next)
     }
 
     fn spawn_extraction(
@@ -612,13 +627,13 @@ mod tests {
         .await;
         let (engine, store, _dir, _h) =
             setup(&hs, "operator", vec![(0, user("I prefer dark mode"))]);
-        engine.flush("s1", 0).await;
+        assert!(!engine.flush("s1", 0).await, "not archived: not caught up");
         assert_eq!(
             store.lock().unwrap().get("s1").archive_next,
             0,
             "not archived: the cursor stays"
         );
-        engine.flush("s1", 5_000).await;
+        assert!(engine.flush("s1", 5_000).await);
         assert_eq!(store.lock().unwrap().get("s1").archive_next, 1);
         assert_eq!(*calls.lock().unwrap(), 2);
     }
@@ -692,6 +707,33 @@ mod tests {
             .map(|t| t["turn_index"].as_i64().unwrap())
             .collect();
         assert_eq!(indexes, vec![0, 3]);
+    }
+
+    #[tokio::test]
+    async fn with_autocapture_off_nothing_is_sent_even_by_a_flush() {
+        let hs = MockHs::start(|req| panic!("unexpected {}", req.path)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(
+            MemoryConfig::parse(
+                &json!({"baseUrl": hs.url(), "apiKey": "k", "autoCapture": false}),
+                &|_| None,
+            )
+            .unwrap(),
+        );
+        let logger = Logger::new(dir.path().join("log"), false);
+        let engine = CaptureEngine::new(CaptureDeps {
+            cfg: cfg.clone(),
+            client: HeliconClient::new(&cfg.base_url, &cfg.api_key, 2_000, logger.clone(), false),
+            store: Arc::new(Mutex::new(SessionStore::new(dir.path().to_path_buf()))),
+            history: Arc::new(FakeHistory {
+                items: Mutex::new(vec![(0, user("I prefer dark mode"))]),
+            }),
+            logger,
+            own_tool_prefix: "helicon__",
+        });
+        engine.schedule("s1");
+        assert!(engine.flush("s1", 1_000).await);
+        assert!(hs.requests().is_empty());
     }
 
     #[tokio::test]

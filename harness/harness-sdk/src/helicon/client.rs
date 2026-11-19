@@ -287,7 +287,13 @@ impl HeliconClient {
             let message = if kind == TransportKind::Deadline {
                 format!("request timed out after {timeout_ms}ms ({what})")
             } else {
-                format!("fetch failed: {err} ({what})")
+                // the address of HeliconSearch is not for the model (these texts reach tool results)
+                let mut text = err.to_string();
+                if let Some(url) = err.url() {
+                    text = text.replace(url.as_str(), "<HeliconSearch>");
+                }
+                let text = text.replace(&self.inner.base_url, "<HeliconSearch>");
+                format!("fetch failed: {text} ({what})")
             };
             HsError::Transport { kind, message }
         };
@@ -859,6 +865,20 @@ mod tests {
             None
         );
         assert_eq!(pick_addressable_memory_id(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_connection_does_not_name_the_server() {
+        let logger = Logger::new(std::env::temp_dir().join("helicon-client-test.log"), false);
+        // nothing listens here
+        let client = HeliconClient::new("http://127.0.0.1:9", "k", 1_000, logger, false);
+        let err = client.health().await.unwrap_err();
+        let text = err.describe();
+        assert!(
+            text.contains("fetch failed") || text.contains("timed out"),
+            "{text}"
+        );
+        assert!(!text.contains("127.0.0.1"), "{text}");
     }
 
     #[test]

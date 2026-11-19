@@ -194,7 +194,12 @@ impl HarnessBuilder {
         }
         let set = Extensions::new(extensions.clone());
         for agent in &mut self.agents {
-            set.decorate(agent, &DecorateContext { tools_registered: false });
+            set.decorate(
+                agent,
+                &DecorateContext {
+                    tools_registered: false,
+                },
+            );
         }
         Ok((extensions, state_dir))
     }
@@ -324,8 +329,12 @@ impl Harness {
     }
     /// Register an agent after startup. Exact repeats are safe; changes need a new ID.
     pub async fn create_agent(&self, mut definition: Agent) -> Result<AgentHandle> {
-        self.extensions
-            .decorate(&mut definition, &DecorateContext { tools_registered: true });
+        self.extensions.decorate(
+            &mut definition,
+            &DecorateContext {
+                tools_registered: true,
+            },
+        );
         for a in std::iter::once(&definition).chain(definition.subagents.iter()) {
             if a.standalone_subagents.as_ref().is_some_and(|c| c.enabled)
                 && self.client.info()["capabilities"]["standalone_subagents"] != true
@@ -418,7 +427,11 @@ impl Harness {
         for ext in list {
             let client = self.client.clone();
             let result = ext
-                .on_start(StartContext { harness: self, client: &client, state_dir })
+                .on_start(StartContext {
+                    harness: self,
+                    client: &client,
+                    state_dir,
+                })
                 .await;
             match result {
                 Ok(()) => started.push(ext),
@@ -541,7 +554,13 @@ impl Harness {
     /// Start a session of `agent` in `workspace`. An agent with subagents also
     /// gets one worker session per subagent and a team joining them.
     pub async fn session(&self, agent: &str, workspace: impl AsRef<Path>) -> Result<Session> {
-        Session::create(self.client.clone(), self.extensions.clone(), agent, workspace.as_ref()).await
+        Session::create(
+            self.client.clone(),
+            self.extensions.clone(),
+            agent,
+            workspace.as_ref(),
+        )
+        .await
     }
     /// Reattach to a session from a [`SessionRef`] you persisted. Only the
     /// session ID is needed; the host knows its team.
@@ -570,10 +589,21 @@ impl AgentHandle {
         &self.id
     }
     pub async fn new_session(&self) -> Result<Session> {
-        Session::create_options(self.client.clone(), self.extensions.clone(), json!({"agent":self.id})).await
+        Session::create_options(
+            self.client.clone(),
+            self.extensions.clone(),
+            json!({"agent":self.id}),
+        )
+        .await
     }
     pub async fn new_session_in(&self, workspace: impl AsRef<Path>) -> Result<Session> {
-        Session::create(self.client.clone(), self.extensions.clone(), &self.id, workspace.as_ref()).await
+        Session::create(
+            self.client.clone(),
+            self.extensions.clone(),
+            &self.id,
+            workspace.as_ref(),
+        )
+        .await
     }
     pub async fn new_session_with(&self, options: crate::SessionOptions) -> Result<Session> {
         let mut value = serde_json::to_value(options)

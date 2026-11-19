@@ -550,10 +550,7 @@ impl Session {
         if let Some(compaction) = options.compaction {
             parameters["compaction"] = json!(compaction);
         }
-        if let Some(addendum) = self
-            .addendum(&id, text, options.instruction_addendum)
-            .await
-        {
+        if let Some(addendum) = self.addendum(&id, text, options.instruction_addendum).await {
             parameters["instruction_addendum"] = json!(addendum);
         }
         if let Some(output) = options.output {
@@ -738,8 +735,14 @@ impl Session {
 
     /// The trusted addendum to send with a turn: the caller's own, as extended by the attached
     /// extensions. Only when the host supports turn context; otherwise the caller's own.
-    async fn addendum(&self, submission_id: &str, text: &str, own: Option<String>) -> Option<String> {
-        if self.extensions.is_empty() || self.client.info()["capabilities"]["turn_context"] != true {
+    async fn addendum(
+        &self,
+        submission_id: &str,
+        text: &str,
+        own: Option<String>,
+    ) -> Option<String> {
+        if self.extensions.is_empty() || self.client.info()["capabilities"]["turn_context"] != true
+        {
             return own;
         }
         self.extensions

@@ -64,9 +64,12 @@ pub(crate) fn startup_budgets(hook_timeout_ms: u64) -> Budgets {
     }
 }
 
+/// A server budget is believed up to this long: a figure beyond it is a mistake, not a budget.
+const MAX_BUDGET_MS: f64 = 600_000.0;
+
 fn positive(v: Option<&Value>) -> Option<u64> {
     let n = v?.as_f64()?;
-    (n.is_finite() && n > 0.0).then(|| n.floor() as u64)
+    (n.is_finite() && n > 0.0).then(|| n.min(MAX_BUDGET_MS).floor() as u64)
 }
 
 #[derive(Default)]
@@ -288,6 +291,17 @@ mod tests {
         // a response without execution drops them
         budgets.learn_from_response(None);
         assert_eq!(budgets.current().source, BudgetSource::Startup);
+    }
+
+    #[test]
+    fn an_absurd_server_budget_is_clamped() {
+        let budgets = RecallBudgets::new("http://h", 15_000, logger());
+        budgets.learn_from_response(Some(&json!({
+            "auto_tier_budget_ms": 1.0e30, "active_budget_ms": 1.0e30, "config_fingerprint": "x"
+        })));
+        let c = budgets.current();
+        assert_eq!((c.auto_ms, c.active_ms), (600_000, 600_000));
+        assert!(budgets.active_deadline_ms() > now_ms());
     }
 
     #[test]

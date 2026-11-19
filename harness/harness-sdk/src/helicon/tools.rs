@@ -570,7 +570,11 @@ impl Tools {
                     &cfg.project_id,
                     Some(from),
                     Some(to),
-                    Some((to - from + 1).min(SESSION_PAGE_SIZE)),
+                    Some(
+                        to.saturating_sub(from)
+                            .saturating_add(1)
+                            .min(SESSION_PAGE_SIZE),
+                    ),
                 )
                 .await
         } else {

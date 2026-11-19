@@ -83,7 +83,7 @@ pub(crate) fn parse_turns(spec: &Value) -> Option<(i64, i64)> {
 /// The window shown around `[first, last]`: `window` messages on each side, clamped to `[0, MAX]`.
 pub(crate) fn window_around(first: i64, last: i64, window: i64) -> (i64, i64) {
     let w = window.clamp(0, MAX_CONTEXT_WINDOW);
-    ((first - w).max(0), last + w)
+    ((first - w).max(0), last.saturating_add(w))
 }
 
 /// What the marked messages are: where the memory was taken from, or the excerpt asked for.
@@ -162,7 +162,7 @@ pub(crate) fn format_page(
     if mode == PageMode::Session && more {
         tail.push(format!(
             "(more follows: call helicon__memory_get again with context=\"session\", session=\"{session_id}\", fromTurn={})",
-            b + 1
+            b.saturating_add(1)
         ));
     }
     if mode == PageMode::Around {
@@ -227,6 +227,15 @@ mod tests {
         assert_eq!(parse_turns(&json!("x")), None);
         assert_eq!(parse_turns(&json!(-1)), None);
         assert_eq!(parse_turns(&json!(null)), None);
+    }
+
+    #[test]
+    fn numbers_near_the_limit_do_not_overflow() {
+        assert_eq!(
+            window_around(i64::MAX - 1, i64::MAX, 20),
+            (i64::MAX - 21, i64::MAX)
+        );
+        assert_eq!(window_around(0, i64::MAX, 3).1, i64::MAX);
     }
 
     #[test]

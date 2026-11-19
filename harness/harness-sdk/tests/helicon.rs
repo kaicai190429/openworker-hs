@@ -350,3 +350,32 @@ async fn an_unreachable_heliconsearch_never_fails_a_turn() {
     within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();
 }
+
+/// The engine in an SDK-owned child process: the extension lives in this process either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn it_works_the_same_with_the_engine_in_a_child_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(&root, &hs, json!({"sessionBridge": false}));
+    let h = Harness::builder()
+        .state_dir(root.join("state"))
+        .executable(runner())
+        .tools(tool::registry())
+        .sandbox(Sandbox::Off)
+        .scripted(true)
+        .managed(runner(), openworker_sdk::RestartPolicy::default())
+        .await
+        .unwrap();
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    let r = within(s.run(SAY)).await.unwrap();
+    assert_eq!(r.status, RunStatus::Completed);
+    let query = seen(&hs, "/v1/memory/query").await;
+    assert_eq!(query.body["query"], SAY);
+    let turns = seen(&hs, "/v1/memory/session/turn").await;
+    assert_eq!(turns.body["turns"][0]["content"], SAY);
+    within(s.close()).await.unwrap();
+    seen(&hs, "/v1/memory/session/end").await;
+    within(h.shutdown()).await.unwrap();
+}
