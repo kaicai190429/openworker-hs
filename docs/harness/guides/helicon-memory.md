@@ -150,6 +150,12 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
   its facts available right after it closes.
 - **Recalled memory is data, not instructions.** Both the recall and the first-turn summary are added with a notice
   saying so, and escaped.
+- **A retry gets the same text.** The recall for one submission is remembered, so resending a submission id (after
+  an unknown outcome) sends the same turn context. The memory is kept in process: after an application restart a
+  resend recalls again, and if the answer differs the engine refuses the id as a changed turn context; resend with
+  a new submission id.
+- **Guardrails see the recalled text.** The engine runs its safety hooks over the whole turn addendum, so a
+  guardrail that blocks on a remembered sentence blocks that turn, every time that sentence is recalled.
 - **Everything said is sent to HeliconSearch** and stored there verbatim, with the facts extracted from it.
   Tool calls and their results are archived too, except the memory and media tools' own.
 
@@ -176,8 +182,8 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
   application uses the Rust SDK's own memory extension (`helicon-memory-rust.md`), which reads the same
   `helicon-memory.json`.
 - Recall covers the turns you send through a `Session`. Sub-agents and team members started by the engine, and
-  turns the engine starts by itself (timers), are not given recalled memory, and whether they are captured has
-  not been verified.
+  turns the engine starts by itself (timers), are not given recalled memory and are not captured: only the
+  session you created or resumed is.
 - Images and documents a user attaches are archived as placeholders, not their bytes.
 - An application that is killed (no `close()`, no `shutdown()`) has its open sessions ended at the next start, not at once.
 

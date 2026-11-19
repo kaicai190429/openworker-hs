@@ -26,8 +26,10 @@ const SAFE_ID = /^[A-Za-z0-9_.-]{1,128}$/;
 export class SessionStore {
   private readonly dir: string;
   private readonly cache = new Map<string, SessionRecord>();
+  /** The last save failed (said once per run of failures, not on every save). */
+  private failing = false;
 
-  constructor(root: string) {
+  constructor(root: string, private readonly warn?: (message: string) => void) {
     this.dir = join(root, "sessions");
   }
 
@@ -76,8 +78,14 @@ export class SessionStore {
       const tmp = `${f}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
       renameSync(tmp, f);
-    } catch {
-      /* the cursors are an optimisation: without them the next run resends, and the server de-duplicates */
+      this.failing = false;
+    } catch (err) {
+      // the cursors are an optimisation: without them the next run resends, and the server de-duplicates.
+      // A failure is still said, once, so a full disk or a bad permission does not go unnoticed.
+      if (!this.failing) {
+        this.failing = true;
+        this.warn?.(`could not save the progress of session ${sessionId}: ${err instanceof Error ? err.message : String(err)} (it will be sent again after a restart)`);
+      }
     }
   }
 

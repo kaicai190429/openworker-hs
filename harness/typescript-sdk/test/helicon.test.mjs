@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadHeliconConfig } from "../dist/helicon/config-file.js";
@@ -162,6 +163,12 @@ function fakeHarness(historyBySession) {
   };
 }
 
+/** A turn of a session the SDK created ends: the journal says so (a session that never went through a Session is not ours). */
+function emitDone(t, sid) {
+  t.adapter.onSessionCreated(sid, "a");
+  t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+}
+
 async function attach(behaviour = {}, extra = {}) {
   const hs = await startFakeHelicon(behaviour);
   const dir = await stateWith({ baseUrl: hs.url, apiKey: "hs_test", agentId: "tester", captureMode: "operator", closeWaitMs: 0, debug: true, ...extra });
@@ -255,7 +262,7 @@ test("a completed turn archives the new history, extracts, and skips the adapter
       { index: 2, item: { type: "function_call_output", call_id: "c1", output: "recalled stuff" } },
       { index: 3, item: { role: "assistant", type: "message", content: [{ type: "output_text", text: "noted" }] } },
     ]);
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid, turn_id: "t1" });
+    emitDone(t, sid);
     assert.ok(await until(() => t.hs.calls.some((c) => c.path === "/v1/memory/add")), "extraction reached HeliconSearch");
 
     const turn = t.hs.calls.find((c) => c.path === "/v1/memory/session/turn");
@@ -280,6 +287,7 @@ test("the capture mode decides how facts are made: operator hands the conversati
     ]]]);
     const harness = fakeHarness(history);
     const adapter = await HeliconAdapter.attach(harness, dir);
+    adapter.onSessionCreated("s_mode");
     harness.emit("session/event", { type: "turn_completed", session_id: "s_mode" });
     await until(() => hs.calls.some((c) => c.path === "/v1/memory/add" || c.path === "/v1/memory/store"));
     await wait(200);
@@ -298,7 +306,7 @@ test("what could not be archived is sent by the next cycle, from the saved curso
   try {
     const sid = "s_retry";
     t.history.set(sid, [{ index: 0, item: { role: "user", content: "one" } }, { index: 1, item: { role: "assistant", type: "message", content: [{ type: "output_text", text: "two" }] } }]);
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    emitDone(t, sid);
     // the client tries three times before the cycle gives up
     assert.ok(await until(() => t.hs.calls.filter((c) => c.path === "/v1/memory/session/turn").length >= 3));
     await wait(300);
@@ -306,7 +314,7 @@ test("what could not be archived is sent by the next cycle, from the saved curso
 
     t.hs.behaviour.failTurns = false;
     t.history.get(sid).push({ index: 2, item: { role: "user", content: "three" } });
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    emitDone(t, sid);
     assert.ok(await until(() => t.hs.calls.some((c) => c.path === "/v1/memory/add")));
     const ok = t.hs.calls.filter((c) => c.path === "/v1/memory/session/turn").at(-1);
     assert.deepEqual(ok.body.turns.map((x) => x.turn_index), [0, 1, 2], "the whole unsent stretch goes, nothing is lost");
@@ -319,14 +327,14 @@ test("an extraction that failed is retried even when a later one succeeded first
   try {
     const sid = "s_gap";
     t.history.set(sid, [{ index: 0, item: { role: "user", content: "first" } }, { index: 1, item: { role: "assistant", type: "message", content: [{ type: "output_text", text: "one" }] } }]);
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    emitDone(t, sid);
     assert.ok(await until(() => t.hs.calls.some((c) => c.path === "/v1/memory/add"))); // the doomed one is in flight
     t.history.get(sid).push({ index: 2, item: { role: "user", content: "second" } }, { index: 3, item: { role: "assistant", type: "message", content: [{ type: "output_text", text: "two" }] } });
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    emitDone(t, sid);
     await wait(2000); // the first has failed, the second has succeeded
 
     t.history.get(sid).push({ index: 4, item: { role: "user", content: "third" } });
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    emitDone(t, sid);
     assert.ok(await until(() => t.hs.calls.filter((c) => c.path === "/v1/memory/add").length >= 3, 6000));
     await wait(1200);
     const sent = t.hs.calls.filter((c) => c.path === "/v1/memory/add").flatMap((c) => c.body.messages.map((m) => m.turn_index));
@@ -391,7 +399,7 @@ test("only the agents named in the configuration get memory", async () => {
     t.adapter.onSessionCreated("s_coder", "coder");
     assert.equal(await t.adapter.prepareTurn({ sessionId: "s_coder", text: "what do I like?", submissionId: "x1", userAddendum: "Mine." }), "Mine.");
     say(t.history, "s_coder", "secret plans");
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_coder" });
+    emitDone(t, "s_coder");
     await t.adapter.onSessionClose("s_coder");
     await t.adapter.shutdown();
     assert.deepEqual(t.hs.calls.filter((c) => c.path !== "/v1/memory/health"), [], "HeliconSearch heard nothing about it");
@@ -441,8 +449,8 @@ test("shutdown ends the sessions this run worked on, but not the ones already cl
   try {
     say(t.history, "s_open", "hello");
     say(t.history, "s_closed", "bye");
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_open" });
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_closed" });
+    emitDone(t, "s_open");
+    emitDone(t, "s_closed");
     assert.ok(await until(() => t.hs.calls.filter((c) => c.path === "/v1/memory/session/turn").length >= 2));
     await t.adapter.onSessionClose("s_closed");
     await t.adapter.shutdown();
@@ -468,8 +476,8 @@ test("shutdown only sends what is pending when endOnShutdown is off, and a sessi
   const t = await attach({}, { endOnShutdown: false });
   try {
     say(t.history, "s_quiet", "hello");
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_quiet" });
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_empty" }); // no history at all
+    emitDone(t, "s_quiet");
+    emitDone(t, "s_empty"); // no history at all
     await t.adapter.shutdown();
     assert.deepEqual(sessionEnds(t.hs), []);
     assert.ok(t.hs.calls.some((c) => c.path === "/v1/memory/session/turn"), "what was pending was still archived");
@@ -477,7 +485,7 @@ test("shutdown only sends what is pending when endOnShutdown is off, and a sessi
   const e = await attach();
   try {
     t.history.clear();
-    e.harness.emit("session/event", { type: "turn_completed", session_id: "s_empty" });
+    emitDone(e, "s_empty");
     await e.adapter.shutdown();
     assert.deepEqual(sessionEnds(e.hs), [], "nothing archived, nothing to end");
   } finally { await e.hs.close(); }
@@ -487,13 +495,13 @@ test("a session left idle is ended once, and ended again after it has been used 
   const t = await attach({}, { idleEndMs: 1000 });
   try {
     say(t.history, "s_idle", "hello");
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_idle" });
+    emitDone(t, "s_idle");
     assert.ok(await until(() => sessionEnds(t.hs).length === 1, 6000), "ended after the idle time");
     await wait(2500);
     assert.equal(sessionEnds(t.hs).length, 1, "not ended again while nothing happens");
 
     t.history.get("s_idle").push({ index: 2, item: { role: "user", content: "back again" } });
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_idle" });
+    emitDone(t, "s_idle");
     assert.ok(await until(() => sessionEnds(t.hs).length === 2, 8000), "ended again after new activity");
     const turns = t.hs.calls.filter((c) => c.path === "/v1/memory/session/turn");
     assert.deepEqual(turns.at(-1).body.turns.map((x) => x.turn_index), [2], "the later turn went to the same session");
@@ -710,7 +718,7 @@ test("autoCapture off sends nothing, not even when a session is closed or the ha
   try {
     say(t.history, "s_off", "I prefer teal, remember that");
     t.adapter.onSessionCreated("s_off");
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_off" });
+    emitDone(t, "s_off");
     await wait(500);
     await t.adapter.onSessionClose("s_off");
     say(t.history, "s_off2", "I prefer teal too, remember that");
@@ -776,7 +784,7 @@ test("without syncTranscript a session is not ended on HeliconSearch, but closin
   try {
     say(t.history, "s_nosync", "hello there");
     t.adapter.onSessionCreated("s_nosync");
-    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_nosync" });
+    emitDone(t, "s_nosync");
     await t.adapter.onSessionClose("s_nosync"); // right away: the 300ms debounce has not fired
     assert.equal(turnCalls(t.hs).length, 1, "the pending turn was archived at close");
     assert.deepEqual(sessionEnds(t.hs), []);
@@ -799,12 +807,12 @@ test("a write HeliconSearch refuses with HTTP 200 and a retcode is an error to r
   try {
     const sid = "s_refused";
     t.history.set(sid, [{ index: 0, item: { role: "user", content: "I prefer teal" } }]);
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    emitDone(t, sid);
     assert.ok(await until(() => t.hs.calls.some((c) => c.path === "/v1/memory/add")));
     await wait(500);
     assert.equal(new SessionStore(join(t.dir, "helicon-memory")).get(sid).extractNext, 0, "not extracted: the cursor stays");
     // the next cycle sends the same slice again, and this time it is taken
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    emitDone(t, sid);
     assert.ok(await until(() => t.hs.calls.filter((c) => c.path === "/v1/memory/add").length >= 2));
     assert.ok(await until(() => new SessionStore(join(t.dir, "helicon-memory")).get(sid).extractNext === 1));
   } finally { await t.done(); }
@@ -833,9 +841,66 @@ test("a session with a turn in flight is not idle however quiet it is", async ()
     await t.adapter.prepareTurn({ sessionId: sid, text: "hello there my friend", submissionId: "x" }); // a turn is sent
     await wait(2_600); // quiet for longer than the limit, and two sweeps
     assert.deepEqual(sessionEnds(t.hs), [], "a turn in flight keeps its session open");
-    t.harness.emit("session/event", { type: "turn_completed", session_id: sid }); // the turn ends
+    emitDone(t, sid); // the turn ends
     assert.ok(await until(() => sessionEnds(t.hs).includes(`openworker/${sid}`), 8_000), "now it is idle, and is ended");
     await wait(1_500);
     assert.equal(sessionEnds(t.hs).length, 1, "once");
   } finally { await t.done(); }
+});
+
+test("journal events of sessions that did not go through a Session (a team's workers) are not captured", async () => {
+  const t = await attach();
+  try {
+    say(t.history, "s_worker", "I prefer teal, remember that");
+    say(t.history, "s_lead", "I prefer teal, remember that too");
+    t.adapter.onSessionCreated("s_lead", "a");
+    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_worker" }); // the SDK attached it, nobody created it
+    t.harness.emit("session/event", { type: "turn_completed", session_id: "s_lead" });
+    assert.ok(await until(() => turnCalls(t.hs).length >= 1));
+    await wait(700);
+    const sent = turnCalls(t.hs).map((c) => c.body.session_id);
+    assert.deepEqual(sent, ["openworker/s_lead"], "only the lead is archived");
+    // a gap re-looks at the sessions in use: still not the worker
+    t.harness.emit("stream/gap", {});
+    await wait(700);
+    assert.deepEqual(turnCalls(t.hs).map((c) => c.body.session_id), ["openworker/s_lead"]);
+  } finally { await t.done(); }
+});
+
+test("activity is noted in memory at once but written to the session's file only every few seconds", async () => {
+  const t = await attach({}, { autoRecall: false, sessionBridge: false });
+  try {
+    t.adapter.onSessionCreated("s_act", "a");
+    await t.adapter.prepareTurn({ sessionId: "s_act", text: "hello there my friend", submissionId: "a1" });
+    const file = () => JSON.parse(readFileSync(join(t.dir, "helicon-memory", "sessions", "s_act.json"), "utf8"));
+    const first = file().lastActive;
+    await wait(40);
+    await t.adapter.prepareTurn({ sessionId: "s_act", text: "and another message", submissionId: "a2" });
+    assert.ok(t.adapter.store.get("s_act").lastActive > first, "in memory it moved on (what the idle sweep reads)");
+    assert.equal(file().lastActive, first, "the file was not rewritten");
+  } finally { await t.done(); }
+});
+
+test("a save of a session's progress that fails is said once, not swallowed", async () => {
+  const { mkdir } = await import("node:fs/promises");
+  const root = await mkdtemp(join(tmpdir(), "ow-helicon-save-"));
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, "sessions"), "not a directory"); // the sessions directory cannot be made
+  const said = [];
+  const store = new SessionStore(root, (m) => said.push(m));
+  store.get("s1").archiveNext = 3;
+  store.save("s1");
+  store.save("s1");
+  assert.equal(said.length, 1, "once, not on every save");
+  assert.match(said[0], /could not save the progress of session s1/);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("an absurd recall budget from the server is clamped", async () => {
+  const { RecallBudgets } = await import("../dist/helicon/recall-budget.js");
+  const budgets = new RecallBudgets("http://budget-clamp.invalid", 15_000, { info() {}, warn() {} });
+  budgets.fromResponse({ auto_tier_budget_ms: 1e30, active_budget_ms: 1e30, config_fingerprint: "x" });
+  assert.equal(budgets.current().autoMs, 600_000);
+  assert.equal(budgets.current().activeMs, 600_000);
+  assert.ok(Number.isFinite(budgets.activeDeadlineMs()) && budgets.activeDeadlineMs() - Date.now() < 700_000);
 });

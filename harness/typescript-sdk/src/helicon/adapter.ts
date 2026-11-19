@@ -147,7 +147,7 @@ export class HeliconAdapter {
       logger: this.logger,
       debug: cfg.debug,
     });
-    this.store = new SessionStore(root);
+    this.store = new SessionStore(root, (message) => this.logger.warn(`[${PLUGIN_ID}] ${message}`));
     this.budgets = new RecallBudgets(cfg.baseUrl, cfg.hookTimeoutMs, this.logger);
     const strategy: CaptureStrategy =
       cfg.captureMode === "operator" ? createOperatorStrategy(this.client) : createDirectStrategy(this.client);
@@ -277,6 +277,16 @@ export class HeliconAdapter {
 
   /** Sessions of agents that do not get memory: nothing of them is recalled, archived or ended. */
   private readonly excluded = new Set<string>();
+
+  /**
+   * Sessions that went through the SDK's own `Session` (the lead of a team). The SDK attaches a team's worker
+   * sessions as well, so their journal events reach the adapter: they are not ours, and are neither recalled
+   * into nor captured.
+   */
+  private readonly leads = new Set<string>();
+
+  /** When each session's activity was last written to its file (activity itself is noted in memory at once). */
+  private readonly savedAt = new Map<string, number>();
 
   /** Sessions with a turn in flight (when it was sent): a turn that waits for an approval, a slow tool or a slow model is quiet, but the session is not idle. */
   private readonly running = new Map<string, number>();
@@ -435,6 +445,7 @@ export class HeliconAdapter {
       this.excluded.add(sessionId);
       return;
     }
+    this.leads.add(sessionId);
     this.known.add(sessionId);
     const rec = this.store.get(sessionId);
     rec.bridgePending = true;
@@ -448,6 +459,7 @@ export class HeliconAdapter {
       this.excluded.add(sessionId);
       return;
     }
+    this.leads.add(sessionId);
     // A session this adapter has not seen before is only looked at when it takes a turn: attaching a list of
     // old sessions must not archive (and end) all of their histories.
     if (this.store.has(sessionId)) {
@@ -459,12 +471,18 @@ export class HeliconAdapter {
   /** The session is in use: it is not idle, and if it had been ended it is open again. */
   private touch(sessionId: string): void {
     this.known.add(sessionId);
+    this.leads.add(sessionId); // (a `close` that failed leaves the session open: it is followed again)
     const rec = this.store.get(sessionId);
     const now = Date.now();
-    if (!rec.ended && now - rec.lastActive < 5_000) return; // saving on every event is not needed
+    // activity is noted at once (the idle sweep reads it from memory), and written to the file at most every
+    // few seconds, or at once when it reopens a session that had been ended
     rec.lastActive = now;
+    const reopened = rec.ended;
     rec.ended = false;
-    this.store.save(sessionId);
+    if (reopened || now - (this.savedAt.get(sessionId) ?? 0) >= 5_000) {
+      this.savedAt.set(sessionId, now);
+      this.store.save(sessionId);
+    }
   }
 
   private onJournal(method: string, params: unknown): void {
@@ -477,7 +495,7 @@ export class HeliconAdapter {
     if (typeof e?.session_id === "string" && typeof e.type === "string" && TURN_ENDED.has(e.type)) {
       this.running.delete(e.session_id);
     }
-    if (e?.type === "turn_completed" && typeof e.session_id === "string" && !this.excluded.has(e.session_id)) {
+    if (e?.type === "turn_completed" && typeof e.session_id === "string" && !this.excluded.has(e.session_id) && this.leads.has(e.session_id)) {
       this.touch(e.session_id); // also makes the session known to the adapter
       this.capture.schedule(e.session_id);
     }
@@ -555,6 +573,8 @@ export class HeliconAdapter {
     this.capture.release(sessionId);
     this.attached.delete(sessionId);
     this.known.delete(sessionId);
+    this.leads.delete(sessionId);
+    this.savedAt.delete(sessionId);
   }
 
   /** Ends the sessions nobody has touched for `idleEndMs`. */

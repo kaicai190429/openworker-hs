@@ -30,8 +30,11 @@ export const DEFAULT_HOOK_TIMEOUT_MS = 15_000;
 /** the active retrieval's start-up value is at most this (less the transport margin) */
 const ACTIVE_START_CAP_MS = 60_000;
 
+/** A server budget is believed up to this long: a figure beyond it is a mistake, not a budget (and an absurd one would overflow a timer). */
+const MAX_BUDGET_MS = 600_000;
+
 function positive(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined;
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.min(Math.floor(v), MAX_BUDGET_MS) : undefined;
 }
 
 /**
