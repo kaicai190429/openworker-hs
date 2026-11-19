@@ -134,7 +134,7 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
 | `hookTimeoutMs` | `15000` (1000–120000) | The longest a turn waits for memory before it goes on without it. |
 | `timeoutMs` | `10000` (1000–120000) | Timeout of ordinary HeliconSearch calls (recall, the operator and summaries have their own). |
 | `endOnShutdown` | `true` | `Harness::shutdown` ends the sessions this run worked on and did not close. |
-| `idleEndMs` | `1800000` (1000–86400000) | A session with no activity for this long (ms) is ended; a session an earlier run left open is ended at the next start (or once it has been quiet that long). `0`: never. |
+| `idleEndMs` | `1800000` (1000–86400000) | A session with no activity for this long (ms) is ended; a session an earlier run left open is ended at the next start (or once it has been quiet that long). A session with a turn in flight is never idle (an approval, a slow tool or a slow model can keep it quiet for longer). `0`: never. |
 | `syncTranscript` | `true` | `false`: sessions are archived but never ended on HeliconSearch (no session summary). |
 | `summaryOnSessionEnd` | `true` | After ending a session that HeliconSearch did not summarise itself, ask it for the summary. |
 | `agents` | all | Ids of the agents (`Agent::new("<id>")`) that get memory. Every other agent of the harness is left alone: its sessions are neither recalled into nor archived. |

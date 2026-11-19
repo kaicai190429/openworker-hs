@@ -80,6 +80,9 @@ const CLOSE_MARGIN_MS: u64 = 15_000;
 const SHUTDOWN_BUDGET_MS: u64 = 45_000;
 /// Sessions of earlier runs ended per start.
 const ORPHANS_PER_START: usize = 10;
+/// A turn in flight keeps its session from being called idle for this long at most (a turn whose end
+/// we never saw must not keep a session open for ever).
+const RUNNING_CAP_MS: u64 = 6 * 3_600_000;
 
 /// `text` (blocks that each end with `</relevant-memories>`) within `room` bytes. A cut keeps the last
 /// envelope closed, so what follows the addendum (the engine's own notes) is not read as part of it.
@@ -153,6 +156,9 @@ struct Inner {
     known: Mutex<HashSet<String>>,
     /// Sessions of agents that do not get memory: nothing of them is recalled, archived or ended.
     excluded: Mutex<HashSet<String>>,
+    /// Sessions with a turn in flight (when it was sent): a turn that waits for an approval, a slow tool or
+    /// a slow model is quiet, but the session is not idle.
+    running: Mutex<HashMap<String, u64>>,
     ending: Mutex<HashMap<String, Ending>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -183,6 +189,7 @@ impl Inner {
             attached: Mutex::default(),
             known: Mutex::default(),
             excluded: Mutex::default(),
+            running: Mutex::default(),
             ending: Mutex::default(),
             tasks: Mutex::default(),
             cfg,
@@ -266,6 +273,10 @@ impl Inner {
             return own_addendum;
         }
         self.touch(session_id);
+        self.running
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), now_ms());
         let key = format!("{session_id}:{}", turn.submission_id);
         let cached = self.recalled.lock().unwrap().get(&key).cloned();
         let ours = match cached {
@@ -432,6 +443,13 @@ impl Inner {
                 if !self.touch_event(id) {
                     return; // not a session that went through a Session, or one that is closed
                 }
+                // the turn is over, however it ended (events of a turn that is still going do not end it)
+                if matches!(
+                    e.kind.as_str(),
+                    "turn_completed" | "turn_failed" | "turn_cancelled" | "turn_recovered"
+                ) {
+                    self.running.lock().unwrap().remove(id);
+                }
                 if e.kind == "turn_completed" {
                     if let Some(capture) = self.capture() {
                         capture.schedule(id);
@@ -582,6 +600,7 @@ impl Inner {
     async fn session_closing(self: &Arc<Self>, session: &SessionInfo) {
         let id = &session.session_id;
         self.attached.lock().unwrap().remove(id);
+        self.running.lock().unwrap().remove(id);
         if self.excluded.lock().unwrap().remove(id) {
             return;
         }
@@ -623,6 +642,15 @@ impl Inner {
         }
         let now = now_ms();
         for id in self.known_sessions() {
+            let in_flight = self
+                .running
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|since| now.saturating_sub(*since) < RUNNING_CAP_MS);
+            if in_flight {
+                continue;
+            }
             let idle = {
                 let mut store = self.store.lock().unwrap();
                 let rec = store.get(&id);
@@ -1396,5 +1424,77 @@ mod tests {
         inner.touch("s1");
         assert_eq!(saved()["ended"], false);
         assert!(saved()["lastActive"].as_u64().unwrap() > first);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_turn_in_flight_is_not_idle_however_quiet_it_is() {
+        use crate::Notification;
+        let hs = MockHs::start(|req| match req.path.as_str() {
+            "/v1/memory/session/end" => Reply::ok(json!({"status": "closed", "memory_id": "m"})),
+            _ => capture_hs()(req),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(
+            &hs,
+            dir.path(),
+            json!({"idleEndMs": 1000, "autoRecall": false, "sessionBridge": false}),
+        );
+        with_capture(
+            &ext,
+            vec![
+                (0, json!({"role": "user", "content": "I prefer dark mode"})),
+                (
+                    1,
+                    json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Noted."}]}),
+                ),
+            ],
+        );
+        let inner = &ext.inner;
+        let s = session("s1");
+        ext.on_session_created(&s);
+        let quiet = |ms: u64| {
+            let mut store = inner.store.lock().unwrap();
+            store.get("s1").last_active = util::now_ms() - ms;
+        };
+        let ends = || {
+            hs.requests()
+                .iter()
+                .filter(|r| r.path == "/v1/memory/session/end")
+                .count()
+        };
+
+        // a turn is sent and goes quiet for longer than the idle limit (an approval, a slow tool, a slow model)
+        assert_eq!(
+            turn(&ext, &s, "a", "hello there my friend", None).await,
+            None
+        );
+        quiet(5_000);
+        inner.sweep_idle();
+        settle().await;
+        assert_eq!(ends(), 0, "a turn in flight keeps its session open");
+
+        // the turn ends; the session is quiet from then on, and now it is idle
+        inner.on_notification(Notification::Event(crate::Event {
+            event_id: 1,
+            session_id: "s1".into(),
+            turn_id: None,
+            kind: "turn_completed".into(),
+            data: json!({}),
+        }));
+        quiet(5_000);
+        inner.sweep_idle();
+        for _ in 0..100 {
+            if ends() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ends(), 1);
+        // ended: dropped from memory, and not ended again
+        inner.sweep_idle();
+        settle().await;
+        assert_eq!(ends(), 1);
+        assert!(!inner.known.lock().unwrap().contains("s1"));
     }
 }
