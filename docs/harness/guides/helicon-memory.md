@@ -2,7 +2,7 @@
 
 The TypeScript SDK can give your agents long-term memory and a searchable library of the user's images and
 videos, both served by
-[HeliconSearch](https://github.com/intel-innersource/applications.ai.ainas.heliconsearch). It is off until you
+HeliconSearch. It is off until you
 add one configuration file. Your application code does not change: the same `Harness.start`, `newSession`,
 `run`, `send` and `close` calls apply.
 
@@ -27,7 +27,8 @@ You need a HeliconSearch server you can reach (by default `http://127.0.0.1:5001
 
 ```sh
 # 1. administrator, once: register a tenant and write the configuration (the token stays in an environment variable)
-HELICON_TENANT_ADMIN_PW=<administrator password>   node scripts/helicon-provision.mjs --url http://hs-host:5001 --tenant my-app --env HELICON_TENANT_TOKEN
+HELICON_TENANT_ADMIN_PW=<administrator password> \
+  node scripts/helicon-provision.mjs --url http://hs-host:5001 --tenant my-app --env HELICON_TENANT_TOKEN
 # 2. put the file it wrote (./helicon-memory.json) in your harness stateDir, and give the process the token
 export HELICON_TENANT_TOKEN=hs_...
 # 3. run your application as usual
@@ -143,7 +144,10 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
 - **`close()` does not wait for HeliconSearch to finish.** It sends what is pending (the verbatim archive) and ends
   the session; HeliconSearch extracts facts and writes the summary on its own, usually within a minute, and
   longer when its queue is busy. Facts the running process was already extracting continue while it lives.
-  Set `closeWaitMs` only for a short-lived script that wants its own extraction finished before it exits.
+  `closeWaitMs` makes `close()` wait (up to that long) for HeliconSearch's answer to this session's extraction
+  request: HeliconSearch answers when the extraction is done, unless it is still busy with that session's earlier
+  work, then it finishes in the background and answers at once. Set it only for a short-lived script that wants
+  its facts available right after it closes.
 - **Recalled memory is data, not instructions.** Both the recall and the first-turn summary are added with a notice
   saying so, and escaped.
 - **Everything said is sent to HeliconSearch** and stored there verbatim, with the facts extracted from it.

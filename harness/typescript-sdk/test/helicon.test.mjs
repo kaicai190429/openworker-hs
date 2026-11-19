@@ -793,3 +793,33 @@ test("summaryOnSessionEnd: false leaves the summary to HeliconSearch", async () 
     assert.equal(t.hs.calls.some((c) => c.path === "/v1/memory/session/summary"), false, "but the summary is not asked for");
   } finally { await t.done(); }
 });
+
+test("a write HeliconSearch refuses with HTTP 200 and a retcode is an error to retry, not an empty success", async () => {
+  const t = await attach({ addRetcodeRefusals: 1 });
+  try {
+    const sid = "s_refused";
+    t.history.set(sid, [{ index: 0, item: { role: "user", content: "I prefer teal" } }]);
+    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    assert.ok(await until(() => t.hs.calls.some((c) => c.path === "/v1/memory/add")));
+    await wait(500);
+    assert.equal(new SessionStore(join(t.dir, "helicon-memory")).get(sid).extractNext, 0, "not extracted: the cursor stays");
+    // the next cycle sends the same slice again, and this time it is taken
+    t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    assert.ok(await until(() => t.hs.calls.filter((c) => c.path === "/v1/memory/add").length >= 2));
+    assert.ok(await until(() => new SessionStore(join(t.dir, "helicon-memory")).get(sid).extractNext === 1));
+  } finally { await t.done(); }
+});
+
+test("a session a run left open moments ago is ended by the idle sweep once it has been quiet long enough", async () => {
+  const hs = await startFakeHelicon();
+  const dir = await stateWith({ baseUrl: hs.url, apiKey: "hs_test", idleEndMs: 1_000 });
+  const sessions = join(dir, "helicon-memory", "sessions");
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(sessions, { recursive: true });
+  await writeFile(join(sessions, "s_moments.json"), JSON.stringify({ startedAt: new Date().toISOString(), bridgePending: false, archiveNext: 4, extractNext: 4, lastActive: Date.now(), ended: false }));
+  const adapter = await HeliconAdapter.attach(fakeHarness(new Map()), dir);
+  try {
+    assert.deepEqual(sessionEnds(hs), [], "too recent to be an orphan at start");
+    assert.ok(await until(() => sessionEnds(hs).includes("openworker/s_moments"), 8000), "the sweep ends it later");
+  } finally { await adapter.shutdown(); await hs.close(); }
+});

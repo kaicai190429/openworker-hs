@@ -1339,6 +1339,20 @@ export function createHeliconClient(opts: {
       const raw = JSON.parse(response.text) as Record<string, unknown>;
       logResponseBody("POST", path, raw);
 
+      // { retcode, retmsg } with HTTP 200 is how HeliconSearch refuses a write it did not accept (a tenant
+      // check): not an empty result, or the slice would be taken for extracted and never sent again
+      if (raw && !("code" in raw) && typeof raw.retcode === "number" && raw.retcode !== 0) {
+        const retmsg = typeof raw.retmsg === "string" ? raw.retmsg : undefined;
+        logFailure("POST", path, response.status, `retcode=${raw.retcode} retmsg=${retmsg ?? "?"}`);
+        throw new HeliconApiError({
+          status: response.status,
+          retcode: raw.retcode,
+          retmsg,
+          body: raw,
+          message: `helicon-memory POST ${path} failed: retcode=${raw.retcode} ${retmsg ?? ""}`,
+        });
+      }
+
       const code = typeof raw?.code === "number" ? raw.code : 200;
       const numbers = (v: unknown): number[] =>
         Array.isArray(v) ? (v as unknown[]).filter((x): x is number => typeof x === "number") : [];

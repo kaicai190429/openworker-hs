@@ -569,8 +569,13 @@ export class HeliconAdapter {
       if (ended >= ORPHANS_PER_START) break;
       if (live.has(id)) continue;
       const rec = this.store.get(id);
-      if (rec.ended || rec.archiveNext === 0 || Date.now() - rec.lastActive < limit) {
+      if (rec.ended || rec.archiveNext === 0) {
         this.store.forget(id);
+        continue;
+      }
+      if (Date.now() - rec.lastActive < limit) {
+        // a run that died moments ago: the idle sweep ends it once it has been quiet for the limit
+        this.known.add(id);
         continue;
       }
       ended++;

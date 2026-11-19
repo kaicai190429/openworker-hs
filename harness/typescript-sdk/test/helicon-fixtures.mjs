@@ -39,6 +39,12 @@ export async function startFakeHelicon(behaviour = {}) {
         // behaviour.addFailures: the next that many extractions are refused (after behaviour.addDelayMs)
         const refuse = (behaviour.addFailures ?? 0) > 0;
         if (refuse) behaviour.addFailures -= 1;
+        // behaviour.addRetcodeRefusals: the next that many are answered with HTTP 200 and { retcode, retmsg }
+        // (how a tenant check refuses a write)
+        if ((behaviour.addRetcodeRefusals ?? 0) > 0) {
+          behaviour.addRetcodeRefusals -= 1;
+          return json(res, 200, { retcode: 7, retmsg: "tenant refused" });
+        }
         return setTimeout(() => (refuse
           ? json(res, 500, { code: 500, message: "extraction down" })
           : json(res, 200, { code: 200, data: [{ action: "ADD", memory_id: "m1", status: "created" }] })), behaviour.addDelayMs ?? 0);
