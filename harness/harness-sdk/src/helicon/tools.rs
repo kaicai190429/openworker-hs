@@ -209,15 +209,27 @@ impl Tools {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let filtered: Vec<&Value> = grounded.iter().filter(|f| score_of(f) >= min).collect();
+        // Facts the server has not verified yet (`needs_verification`: a fact just extracted can sit there on
+        // some builds) are facts too: listed after the grounded ones, and said to be unverified.
+        let unverified = resp["needs_verification"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let filtered: Vec<(&Value, &str)> = grounded
+            .iter()
+            .map(|f| (f, s(f, "support_level")))
+            .chain(unverified.iter().map(|f| (f, "needs_verification")))
+            .filter(|(f, _)| score_of(f) >= min)
+            .collect();
         let ids: Vec<String> = filtered
             .iter()
-            .map(|f| pick_addressable_memory_id(f).unwrap_or_else(|| "-".into()))
+            .map(|(f, _)| pick_addressable_memory_id(f).unwrap_or_else(|| "-".into()))
             .collect();
         self.logger.info(&format!(
-            "{TAG} tool=memory_recall -> memories={} (grounded={}) elapsedMs={} ids=[{}]",
+            "{TAG} tool=memory_recall -> memories={} (grounded={}, needsVerification={}) elapsedMs={} ids=[{}]",
             filtered.len(),
             grounded.len(),
+            unverified.len(),
             now_ms().saturating_sub(started),
             ids.join(",")
         ));
@@ -315,20 +327,16 @@ impl Tools {
         let lines: Vec<String> = filtered
             .iter()
             .enumerate()
-            .map(|(idx, f)| {
+            .map(|(idx, (f, label))| {
                 let pct = pct(score_of(f));
                 // the id must be whole: memory_get matches exactly, a cut one is a 404
                 match pick_addressable_memory_id(f) {
-                    Some(id) => format!(
-                        "{}. [{}] {} ({pct}% id={id})",
-                        idx + 1,
-                        s(f, "support_level"),
-                        s(f, "claim")
-                    ),
+                    Some(id) => {
+                        format!("{}. [{label}] {} ({pct}% id={id})", idx + 1, s(f, "claim"))
+                    }
                     None => format!(
-                        "{}. [{}] {} ({pct}%, no id — cannot be expanded)",
+                        "{}. [{label}] {} ({pct}%, no id — cannot be expanded)",
                         idx + 1,
-                        s(f, "support_level"),
                         s(f, "claim")
                     ),
                 }
@@ -1147,6 +1155,44 @@ mod tests {
         assert!(text.contains("(cut here:"), "{}", &text[text.len() - 200..]);
         assert!(text.len() < MAX_TOOL_OUTPUT_BYTES + 400);
         assert!(text.starts_with("éé"));
+    }
+
+    #[tokio::test]
+    async fn recall_lists_facts_the_server_has_not_verified_yet() {
+        // some builds of the server keep a fact that was just extracted in `needs_verification`
+        let hs = MockHs::start(|_| {
+            Reply::ok(json!({"grounded_facts": [], "needs_verification": [
+                {"id": "pkg:9", "claim": "likes jasmine tea", "score": 0.7, "source_memory_ids": [ID]},
+                {"id": "pkg:8", "claim": "weak", "score": 0.0001, "source_memory_ids": []},
+            ]}))
+        })
+        .await;
+        let t = tools(&hs, json!({}));
+        let text = t.memory_recall(&json!({"query": "tea?"}), "s#t1").await;
+        assert!(text.starts_with("Found 1 memories:"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "1. [needs_verification] likes jasmine tea (70% id={ID})"
+            )),
+            "{text}"
+        );
+        // with grounded facts too: those first
+        let hs = MockHs::start(|_| {
+            Reply::ok(json!({"grounded_facts": [
+                {"id": "pkg:1", "claim": "likes tea", "score": 0.9, "support_level": "grounded", "source_memory_ids": [ID]},
+            ], "needs_verification": [
+                {"id": "pkg:9", "claim": "likes jasmine", "score": 0.7, "source_memory_ids": []},
+            ]}))
+        })
+        .await;
+        let text = tools(&hs, json!({}))
+            .memory_recall(&json!({"query": "tea?"}), "s#t2")
+            .await;
+        assert!(text.contains("1. [grounded] likes tea"), "{text}");
+        assert!(
+            text.contains("2. [needs_verification] likes jasmine"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
