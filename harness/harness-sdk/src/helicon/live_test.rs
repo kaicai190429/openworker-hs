@@ -463,7 +463,8 @@ async fn live_media_search() {
     for hit in results {
         assert!(hit["file"].as_str().is_some_and(|f| !f.is_empty()), "{hit}");
         let similarity = hit["similarity"].as_f64().expect("a similarity");
-        assert!((0.0..=1.0).contains(&similarity), "{hit}");
+        // (a score, not a fraction: a reranked best hit is above 1)
+        assert!(similarity.is_finite() && similarity >= 0.0, "{hit}");
         assert!(
             matches!(hit["type"].as_str(), Some("image" | "video")),
             "{hit}"
@@ -483,4 +484,105 @@ async fn live_media_search() {
             "{similar}"
         );
     }
+}
+
+/// Adds one image to the tenant's default library, waits until it is indexed, and finds it again by what it
+/// shows. The library keeps the file afterwards. Set `HELICON_LIVE_MEDIA_FILE` to an image HeliconSearch can
+/// read (its path on that machine) and `HELICON_LIVE_MEDIA_QUERY` to what it shows. HeliconSearch copies an
+/// uploaded file into its own store under another name, so the new file is told by what the library lists
+/// before and after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_media_upload_round_trip() {
+    let (Ok(url), Ok(token), Ok(file), Ok(query)) = (
+        std::env::var("HELICON_LIVE_URL"),
+        std::env::var("HELICON_LIVE_TOKEN"),
+        std::env::var("HELICON_LIVE_MEDIA_FILE"),
+        std::env::var("HELICON_LIVE_MEDIA_QUERY"),
+    ) else {
+        panic!("set HELICON_LIVE_URL, HELICON_LIVE_TOKEN, HELICON_LIVE_MEDIA_FILE and HELICON_LIVE_MEDIA_QUERY");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(
+        MemoryConfig::parse(
+            &json!({"baseUrl": url, "apiKey": token, "mediaAdminTools": true, "debug": true}),
+            &|_| None,
+        )
+        .unwrap(),
+    );
+    let inner = Inner::new(cfg, dir.path());
+    let libraries = inner.media.media_libraries().await;
+    let kb_id = libraries["libraries"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the tenant has a library: {libraries}"))
+        .to_owned();
+
+    async fn listed(inner: &Inner, kb_id: &str) -> std::collections::BTreeSet<String> {
+        let mut files = std::collections::BTreeSet::new();
+        for page in 1..=20 {
+            let answer = inner
+                .media
+                .media_files(&json!({"kb_id": kb_id, "page": page, "size": 200}))
+                .await;
+            let items = answer["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                break;
+            }
+            files.extend(
+                items
+                    .iter()
+                    .filter_map(|i| i["file"].as_str().map(str::to_owned)),
+            );
+        }
+        files
+    }
+    let before = listed(&inner, &kb_id).await;
+    let stats_before = inner.media.media_statistics(&json!({"kb_id": kb_id})).await;
+    eprintln!("before: {} files; {stats_before}", before.len());
+
+    let uploaded = inner
+        .media
+        .media_upload(&json!({"file_names": [file], "kb_id": kb_id}))
+        .await;
+    eprintln!("media_upload: {uploaded}");
+    assert!(
+        uploaded["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Submitted 1 file(s)")),
+        "{uploaded}"
+    );
+
+    // indexing takes a little while
+    let mut added = None;
+    for attempt in 0..60 {
+        let now = listed(&inner, &kb_id).await;
+        let new: Vec<&String> = now.difference(&before).collect();
+        let stats = inner.media.media_statistics(&json!({"kb_id": kb_id})).await;
+        if new.len() == 1
+            && stats["inProgress"].as_u64() == Some(0)
+            && stats["failures"].as_u64() == Some(0)
+        {
+            added = Some(new[0].clone());
+            eprintln!("indexed after about {}s: {} ({stats})", attempt * 5, new[0]);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    let added = added.expect("the uploaded file is listed and indexed within 5 minutes");
+
+    let found = inner
+        .media
+        .media_search(&json!({"query": query, "max_results": 5, "lowest_similarity": 0}))
+        .await;
+    eprintln!("media_search {query:?}: {found}");
+    let results = found["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failure instead of results: {found}"));
+    let rank = results
+        .iter()
+        .position(|hit| hit["file"].as_str() == Some(added.as_str()));
+    assert!(
+        rank.is_some_and(|r| r < 3),
+        "the uploaded file {added} is among the first three hits of its own description: {found}"
+    );
+    eprintln!("found at rank {}", rank.unwrap() + 1);
 }

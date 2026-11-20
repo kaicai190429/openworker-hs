@@ -81,9 +81,19 @@ pub async fn hs_with(summary_made: bool) -> MockHs {
         p if p.starts_with("/v1/memory/skill/") => Reply::ok(json!({"content": "# Tea skill\nBrew it."})),
         "/v1/memory/store" => Reply::ok(json!({"memory_id": "fedcba9876543210fedcba9876543210", "action": "created"})),
         p if req.method == "DELETE" && p.starts_with("/v1/memory/") => Reply::ok(json!({"deleted": true})),
+        // the multimedia API the media tools use: one library with one hit, answered as {data, retcode, retmsg}
+        "/v1/kb/list" => media(json!({"kb_list": [{"id": "kb1", "name": "photos", "fileNum": 2}]})),
+        "/v1/kb/resolve_default" => media(json!({"kb_id": "kb1", "name": "photos", "created": false, "doc_count": 2})),
+        "/v1/document/search" => media(json!({"data_list": [{"file": "/photos/car.jpg", "type": "image",
+            "similarity": 0.8, "start": 0, "end": 0, "image": "/photos/car.jpg"}]})),
+        "/v1/document/upload" => media(json!({"batch_id": "b1"})),
         other => panic!("unexpected request to the fake HeliconSearch: {other}"),
     })
     .await
+}
+
+fn media(data: Value) -> Reply {
+    Reply::ok(json!({"data": data, "retcode": 0, "retmsg": "success"}))
 }
 
 /// Writes the extension's configuration into the state directory.

@@ -641,3 +641,139 @@ async fn an_agent_given_to_the_builder_loses_the_builtin_memory_but_is_still_rec
     within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_model_searches_and_uploads_media_through_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(
+        &root,
+        &hs,
+        json!({"sessionBridge": false, "autoRecall": false}),
+    );
+    let model = model().await;
+    let h = start(&root, &model).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    let calls = json!([
+        {"name": "helicon__media_search", "arguments": {"query": "a red car"}},
+        {"name": "helicon__media_upload", "arguments": {"file_names": ["/photos/new.jpg"]}},
+    ]);
+    let r = within(s.run(&format!("CALLS:{calls}"))).await.unwrap();
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    assert_eq!(r.final_output.as_deref(), Some("done"));
+
+    // the media tools are on by default, with their rules; the admin tools are not
+    let first = &model.requests()[0];
+    let tools = tool_names(first);
+    for name in ["helicon__media_search", "helicon__media_upload"] {
+        assert!(tools.contains(&name.to_owned()), "{name} in {tools:?}");
+    }
+    assert!(
+        !tools.contains(&"helicon__media_files".to_owned()),
+        "{tools:?}"
+    );
+    assert!(system_of(first).contains("## Media Library (images and videos)"));
+
+    // what the model got back: a hit with its file path, and the upload's receipt
+    let results = tool_results(model.requests().last().unwrap());
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].contains("/photos/car.jpg") && results[0].contains("similarity"),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("Submitted 1 file(s) for indexing into library kb1 (batch b1)"),
+        "{}",
+        results[1]
+    );
+
+    // each reached HeliconSearch the way the tool says, with the tenant credential
+    let paths: Vec<String> = hs
+        .requests()
+        .iter()
+        .map(|r| r.path.split('?').next().unwrap().to_owned())
+        .collect();
+    for want in [
+        "/v1/kb/list",
+        "/v1/document/search",
+        "/v1/kb/resolve_default",
+        "/v1/document/upload",
+    ] {
+        assert!(paths.iter().any(|p| p == want), "{want} in {paths:?}");
+    }
+    let search = &all(&hs, "/v1/document/search")[0];
+    assert_eq!(search.body["message"], "a red car");
+    assert_eq!(search.auth.as_deref(), Some("Bearer hs_test"));
+    assert_eq!(
+        all(&hs, "/v1/document/upload")[0].body["file_names"],
+        json!(["/photos/new.jpg"])
+    );
+
+    // the archive holds the conversation (the user's message names the tools: it is a script), not what the
+    // tools answered
+    let turns = seen(&hs, "/v1/memory/session/turn").await;
+    let archived = turns.body["turns"].to_string();
+    assert!(
+        !archived.contains("/photos/car.jpg") && !archived.contains("Submitted 1 file(s)"),
+        "{archived}"
+    );
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_registered_before_the_media_tools_conflicts_once_they_are_on_unless_they_are_switched_off(
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    let model = model().await;
+
+    // a version without the media tools: the agent is registered with the memory tools only
+    configure(
+        &root,
+        &hs,
+        json!({"sessionBridge": false, "autoMedia": false}),
+    );
+    let h = start(&root, &model).await;
+    h.create_agent(agent()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+
+    // the same state directory, this version's default (the media tools on): the id is taken by the old definition
+    configure(&root, &hs, json!({"sessionBridge": false}));
+    let h = start(&root, &model).await;
+    let refused = h.create_agent(agent()).await;
+    let message = refused.err().map(|e| e.to_string());
+    eprintln!("create_agent for the old id with the media tools on: {message:?}");
+    assert!(
+        message.is_some(),
+        "the documented definition conflict did not happen"
+    );
+    // under a new id it works, with the media tools
+    let renamed = Agent::new("assistant-v2")
+        .instructions("Be helpful.")
+        .memory(true)
+        .approvals(Approvals::Never)
+        .default_model(Model::new("Fixture", "fixture"));
+    let a = h.create_agent(renamed).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    within(s.run("hello")).await.unwrap();
+    assert!(tool_names(&model.requests()[0]).contains(&"helicon__media_search".to_owned()));
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+
+    // with autoMedia switched off the old agent is accepted as it was
+    configure(
+        &root,
+        &hs,
+        json!({"sessionBridge": false, "autoMedia": false}),
+    );
+    let h = start(&root, &model).await;
+    h.create_agent(agent())
+        .await
+        .expect("the old agent id with autoMedia off");
+    within(h.shutdown()).await.unwrap();
+}
