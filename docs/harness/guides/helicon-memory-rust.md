@@ -6,7 +6,8 @@ yourself. It is off until you add one configuration file. Your application code 
 `harness.create_agent` (see [Limits](#limits)).
 
 It is built on a small public seam, the [`Extension`](#the-extension-seam) trait, so the same hooks can serve other
-components. This extension is memory only; media search is not part of the Rust SDK.
+components. It also carries the [media tools](#media-tools): search and upload over HeliconSearch's image and video
+libraries.
 
 With it on:
 
@@ -19,6 +20,8 @@ With it on:
   nobody awaited.
 - **Memory tools.** Agents get `helicon__memory_recall`, `helicon__memory_get`, `helicon__memory_forget` and
   `helicon__skill_get` (and `helicon__memory_store` if you enable it).
+- **Media tools.** Agents also get `helicon__media_search` and `helicon__media_upload` (see [Media tools](#media-tools));
+  `"autoMedia": false` leaves them out.
 - **The engine's built-in memory is turned off** for agents that get these tools (`memory(false)`), so an agent never
   has two memories. Set `replaceBuiltinMemory` to `false` to keep both.
 - **Session summary.** A session is ended on HeliconSearch, which then writes its summary, when you call
@@ -101,7 +104,7 @@ Create `helicon-memory.json` in the harness state directory (`HarnessBuilder::st
 `${NAME}` is read from the process environment when the harness starts, so the token need not be in the file. Without
 a token the memory stays off and a warning is printed to stderr; no file, or `"enabled": false`, means memory is off
 and the SDK is untouched. The TypeScript SDK's HeliconSearch adapter reads the same file format, so one file can serve an
-application written in either language (options that configure media search are accepted and ignored).
+application written in either language (the media options as well).
 
 The token travels in an `Authorization` header: use `https` (or a network you trust) for a server that is not on this
 machine.
@@ -148,6 +151,14 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
 | `closeWaitMs` | `0` (0–300000) | How long `close()` waits for HeliconSearch's answer to this session's extraction request (see below). |
 | `replaceBuiltinMemory` | `true` | Agents get the HeliconSearch tools instead of the engine's built-in `memory_*` tools. |
 | `memoryStoreTool` | `false` | Also give agents a `memory_store` tool. |
+| `autoMedia` | `true` | Give agents the media tools `media_search` and `media_upload`. |
+| `mediaAdminTools` | `false` | Also `media_search_by_image`, `media_libraries`, `media_files` and `media_statistics`. |
+| `mediaMaxResults` | `5` (1–100) | Results of `media_search` when the model does not say (a call asks for at most 50). |
+| `mediaSearchMode` | `2` (0–3) | How HeliconSearch searches: `2` is the VLM + CLIP hybrid. |
+| `mediaMinSimilarity` | `0.05` (0–1) | Weaker matches are dropped (`0`: none is). |
+| `mediaKbId` | `""` | The library `media_upload`, `media_files` and `media_statistics` use when none is named; empty: the one HeliconSearch picks for the tenant. |
+| `mediaRerankModel` | `BGE` | The reranker HeliconSearch applies to a media search. |
+| `mediaInlineImages` | `false` | Read, because the TypeScript SDK shares the file; not supported here (a warning is logged when it is on). |
 | `topK` | `5` (1–50) | Default number of results of `memory_recall`. |
 | `recallTopK` | `12` (1–20) | Memories requested for the automatic recall of a turn. |
 | `recallMinScore` | `0.01` (0–1) | Floor below which a recalled fact is not shown. |
@@ -173,7 +184,8 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
 - **Tool results are cut at 60,000 bytes** (a long conversation page, say), with a note saying so.
 - **Agent definitions change.** When memory is on, `Harness::create_agent` adds the tool names and a short usage note to
   the agent's `tools` and `instructions` (and turns its `memory` off). An agent id is immutable, so these settings are
-  part of the agent: changing `memoryStoreTool`, `autoRecall`, `autoCapture`, `replaceBuiltinMemory` or `agents` in the
+  part of the agent: changing `memoryStoreTool`, `autoMedia`, `mediaAdminTools`, `autoRecall`, `autoCapture`,
+  `replaceBuiltinMemory` or `agents` in the
   file, turning memory on for an agent that exists without it, or upgrading the SDK (the usage note may be reworded)
   makes `create_agent` fail with a definition conflict for that id. The SDK says so on stderr; register the agent under
   a new id (`assistant-v2`). Sessions of an agent registered before memory existed still get recall and capture, only
@@ -228,11 +240,35 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
   tool's text, so changing options never causes this.
 - A session an earlier run left open is ended at the next start, at most 10 per start (a summary queue is not flooded);
   a session with a turn in flight is not called idle for up to 6 hours.
-- Tool results are text. Images and documents a user attaches are archived as placeholders, not their bytes.
+- The memory tools' results are text; the media tools answer with a small JSON object. Images and documents a user
+  attaches are archived as placeholders, not their bytes.
+- **The media tools are on by default, as in the TypeScript SDK.** An agent registered by an earlier version has no
+  media tools in its `tools` and note, so `create_agent` for its id fails with a definition conflict once the
+  extension adds them: register such an agent under a new id, or keep it as it is with `"autoMedia": false`.
+- `media_upload` needs file paths: an extension sees the user's text of a turn, not the images attached to it, so an
+  attached image cannot be added without its path. `mediaInlineImages` (showing the best image to the model) is not
+  supported either: the result of an application tool cannot carry an image.
 - A run that is killed (no `close()`, no `shutdown()`) has its open sessions ended at the next start once they have
   been quiet for `idleEndMs`, not at once.
 - Sessions of an application that never closes them stay known (a few bytes each) until they are ended by the idle
   sweep; the progress files in `<state_dir>/helicon-memory/sessions/` are not removed.
+
+## Media tools
+
+Agents get the tools below (the model sees them as `helicon__<name>`); `autoMedia` and `mediaAdminTools` choose which.
+They work on the tenant's libraries of HeliconSearch's multimedia API (`/v1/kb/*`, `/v1/document/*`) with the same
+token as memory, and port `media-tools.ts` of the TypeScript adapter.
+
+| Tool | What it does |
+| --- | --- |
+| `media_search` | Natural-language search over all of the tenant's libraries; one entry per file (its best similarity), a weak tail dropped. |
+| `media_upload` | Index files into a library (`file_names`, and `kb_id` or the default library). |
+| `media_search_by_image` | `mediaAdminTools`: media like a reference image (`ref_image` path or an earlier `doc_id`). |
+| `media_libraries`, `media_files`, `media_statistics` | `mediaAdminTools`: the libraries, the files of one with their status, indexing progress. |
+
+A result is a small JSON object the model reads and an application can render: `results[]` with `file`, `type`,
+`similarity` and, for a video, `startSeconds` / `endSeconds`. A failure is a text, as with the memory tools. File paths
+are paths on the machine HeliconSearch runs on: it reads the files itself.
 
 ## The extension seam
 

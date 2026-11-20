@@ -955,9 +955,9 @@ fn turn_key(ctx: &crate::ToolContext) -> String {
 /// The tools of this extension, as registered under the `helicon` namespace.
 /// What a tool hands the model at most (UTF-8 bytes): a page of a long conversation, or a skill, can be
 /// far larger than is useful, and it would all be paid for in the context of every later step.
-const MAX_TOOL_OUTPUT_BYTES: usize = 60_000;
+pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 60_000;
 
-fn capped(text: String) -> Value {
+pub(crate) fn capped(text: String) -> Value {
     if text.len() <= MAX_TOOL_OUTPUT_BYTES {
         return Value::String(text);
     }

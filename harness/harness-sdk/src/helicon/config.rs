@@ -1,8 +1,7 @@
 //! The options of the HeliconSearch memory extension and their validation.
 //!
 //! The file format is the one the TypeScript SDK reads (`helicon-memory.json`), so one file serves an
-//! application written in either language. Options that belong to media search are accepted and
-//! ignored here: this extension is memory only.
+//! application written in either language.
 use serde_json::{Map, Value};
 
 /// The server's token: a string that does not print itself (a `{:?}` of the configuration, in a log or a
@@ -70,6 +69,22 @@ pub(crate) struct MemoryConfig {
     pub auto_capture: bool,
     /// Whether the agent gets the `memory_store` tool.
     pub memory_store_tool: bool,
+    /// Whether the agent gets the media tools (`media_search`, `media_upload`).
+    pub auto_media: bool,
+    /// Also `media_search_by_image`, `media_libraries`, `media_files` and `media_statistics`.
+    pub media_admin_tools: bool,
+    /// Results a search returns when the model does not say.
+    pub media_max_results: usize,
+    /// 0-3; 2 is the VLM + CLIP hybrid.
+    pub media_search_mode: i64,
+    /// The library `media_upload`, `media_files` and `media_statistics` use when none is named.
+    pub media_kb_id: String,
+    pub media_rerank_model: String,
+    /// Weaker matches are dropped (0: none is).
+    pub media_min_similarity: f64,
+    /// Read for the file the TypeScript SDK shares; not supported here (the result of an application tool
+    /// cannot carry an image).
+    pub media_inline_images: bool,
     pub capture_mode: CaptureMode,
     pub capture_max_chars: usize,
     pub store_gate: bool,
@@ -367,6 +382,22 @@ impl MemoryConfig {
             auto_recall: boolean(get("autoRecall"), true)?,
             auto_capture: boolean(get("autoCapture"), true)?,
             memory_store_tool: boolean(get("memoryStoreTool"), false)?,
+            auto_media: boolean(get("autoMedia"), true)?,
+            media_admin_tools: boolean(get("mediaAdminTools"), false)?,
+            media_max_results: int("mediaMaxResults", 1, 100, 5)? as usize,
+            media_search_mode: int("mediaSearchMode", 0, 3, 2)?,
+            media_kb_id: get("mediaKbId")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_default(),
+            media_rerank_model: get("mediaRerankModel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("BGE")
+                .to_owned(),
+            media_min_similarity: float("mediaMinSimilarity", 0.0, 1.0, 0.05)?,
+            media_inline_images: boolean(get("mediaInlineImages"), false)?,
             capture_mode: capture_mode(get("captureMode"))?,
             capture_max_chars: int(
                 "captureMaxChars",
@@ -483,13 +514,46 @@ mod tests {
     }
 
     #[test]
-    fn media_options_are_accepted_and_ignored() {
+    fn the_media_options_default_to_the_typescript_sdks() {
+        let cfg = MemoryConfig::parse(&json!({"baseUrl":"http://h"}), &env).unwrap();
+        assert!(cfg.auto_media && !cfg.media_admin_tools && !cfg.media_inline_images);
+        assert_eq!((cfg.media_max_results, cfg.media_search_mode), (5, 2));
+        assert_eq!(cfg.media_kb_id, "");
+        assert_eq!(cfg.media_rerank_model, "BGE");
+        assert_eq!(cfg.media_min_similarity, 0.05);
+    }
+
+    #[test]
+    fn the_media_options_are_read_and_checked() {
         let cfg = MemoryConfig::parse(
-            &json!({"baseUrl":"http://h","autoMedia":false,"mediaMaxResults":3,"idleEndMs":0,"agents":["a"]}),
+            &json!({"baseUrl":"http://h","autoMedia":false,"mediaAdminTools":true,"mediaMaxResults":3,
+                "mediaSearchMode":0,"mediaKbId":" kb1 ","mediaRerankModel":" M ","mediaMinSimilarity":0,
+                "mediaInlineImages":true,"idleEndMs":0,"agents":["a"]}),
             &env,
         )
         .unwrap();
+        assert!(!cfg.auto_media && cfg.media_admin_tools && cfg.media_inline_images);
+        assert_eq!((cfg.media_max_results, cfg.media_search_mode), (3, 0));
+        assert_eq!(cfg.media_kb_id, "kb1");
+        assert_eq!(cfg.media_rerank_model, "M");
+        assert_eq!(cfg.media_min_similarity, 0.0);
         assert_eq!(cfg.idle_end_ms, 0);
         assert_eq!(cfg.agents, Some(vec!["a".to_owned()]));
+        for (key, bad) in [
+            ("mediaMaxResults", json!(0)),
+            ("mediaMaxResults", json!(101)),
+            ("mediaSearchMode", json!(4)),
+            ("mediaMinSimilarity", json!(1.5)),
+            ("autoMedia", json!("yes")),
+        ] {
+            let mut raw = json!({"baseUrl":"http://h"});
+            raw[key] = bad.clone();
+            assert!(MemoryConfig::parse(&raw, &env).is_err(), "{key}={bad}");
+        }
+        // a blank rerank model is the default one
+        let blank =
+            MemoryConfig::parse(&json!({"baseUrl":"http://h","mediaRerankModel":"  "}), &env)
+                .unwrap();
+        assert_eq!(blank.media_rerank_model, "BGE");
     }
 }

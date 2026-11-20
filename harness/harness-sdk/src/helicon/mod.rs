@@ -14,8 +14,8 @@
 //! | `Session::close` | pending work is sent, then the session is ended on HeliconSearch (which writes its summary) |
 //! | harness shutdown | what is still pending is flushed |
 //!
-//! Memory only: media search is not part of this extension (the options that configure it are accepted
-//! in the file and ignored).
+//! The media tools (search and upload over the image and video libraries of HeliconSearch) are part of the
+//! extension: `media.rs`.
 mod bridge;
 mod budget;
 mod capture;
@@ -28,6 +28,7 @@ mod history;
 #[cfg(all(test, feature = "helicon-live-test"))]
 mod live_test;
 mod log;
+mod media;
 mod memory_context;
 #[cfg(test)]
 mod real_shapes;
@@ -56,7 +57,7 @@ use config::MemoryConfig;
 use config_file::ConfigLoad;
 use filters::wrap_relevant_memories_block;
 use futures_util::future::{BoxFuture as SharedBox, FutureExt, Shared};
-use guidance::{memory_guidance, MODEL_TOOL_PREFIX, TOOL_NAMESPACE};
+use guidance::{agent_guidance, MODEL_TOOL_PREFIX, TOOL_NAMESPACE};
 use log::Logger;
 use recall::{perform_auto_recall, RecallParams};
 use serde_json::json;
@@ -143,6 +144,7 @@ struct Inner {
     store: Arc<Mutex<SessionStore>>,
     budgets: RecallBudgets,
     tools: Arc<Tools>,
+    media: Arc<media::MediaTools>,
     /// Set when the harness is up (it needs the protocol client to read history).
     capture: OnceLock<Arc<CaptureEngine>>,
     /// The qualified names an agent lists in `tools` to get the memory tools.
@@ -176,14 +178,19 @@ impl Inner {
             cfg.debug,
         );
         let budgets = RecallBudgets::new(&cfg.base_url, cfg.hook_timeout_ms, logger.clone());
-        let short_names = tools::tool_names(&cfg);
+        let mut short_names = tools::tool_names(&cfg);
+        short_names.extend(media::tool_names(&cfg));
+        if cfg.auto_media && cfg.media_inline_images {
+            logger.warn("[helicon-memory] mediaInlineImages is not supported by this adapter (the result of an application tool cannot carry an image): media_search answers with file paths only");
+        }
         Arc::new(Self {
             tools: Tools::new(cfg.clone(), client.clone(), logger.clone(), budgets.clone()),
+            media: media::MediaTools::new(cfg.clone(), client.clone(), logger.clone()),
             tool_names: short_names
                 .iter()
                 .map(|n| format!("{TOOL_NAMESPACE}.{n}"))
                 .collect(),
-            guidance: memory_guidance(&cfg, &short_names),
+            guidance: agent_guidance(&cfg, &short_names),
             store: Arc::new(Mutex::new(SessionStore::new(root, logger.clone()))),
             capture: OnceLock::new(),
             recalled: Mutex::new(BoundedMap::new(SUBMISSION_CACHE_MAX)),
@@ -825,8 +832,10 @@ impl Extension for HeliconExtension {
                 own_tool_prefix: MODEL_TOOL_PREFIX,
             });
             let _ = inner.capture.set(capture);
+            let mut application_tools = tools::build_tools(&inner.tools);
+            application_tools.extend(media::build_tools(&inner.media));
             ctx.harness
-                .register_tools(TOOL_NAMESPACE, tools::build_tools(&inner.tools))
+                .register_tools(TOOL_NAMESPACE, application_tools)
                 .await?;
 
             let mut tasks = inner.tasks.lock().unwrap();
@@ -1208,7 +1217,9 @@ mod tests {
                 "helicon.memory_recall",
                 "helicon.memory_get",
                 "helicon.memory_forget",
-                "helicon.skill_get"
+                "helicon.skill_get",
+                "helicon.media_search",
+                "helicon.media_upload"
             ]
         );
         assert!(agent
@@ -1223,7 +1234,7 @@ mod tests {
             },
         );
         assert_eq!(agent.instructions_text(), before);
-        assert_eq!(agent.tool_names().len(), 5);
+        assert_eq!(agent.tool_names().len(), 7);
         // an agent the host compiles before tools exist only gives up the built-in memory
         let mut early = Agent::new("early").instructions("E").memory(true);
         ext.decorate_agent(

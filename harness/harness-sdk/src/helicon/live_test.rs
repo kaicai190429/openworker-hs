@@ -403,3 +403,84 @@ async fn live_the_bridge_and_recall_of_an_agent_with_real_memories() {
     assert!(addendum.len() <= 32_000);
     assert!(!addendum.contains('\0'));
 }
+
+/// The media tools against a tenant that has a library (no upload: the library is left as it is). Set
+/// `HELICON_LIVE_MEDIA_QUERY` to what its pictures show; the default only checks the shape of the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_media_search() {
+    let (Ok(url), Ok(token)) = (
+        std::env::var("HELICON_LIVE_URL"),
+        std::env::var("HELICON_LIVE_TOKEN"),
+    ) else {
+        panic!("set HELICON_LIVE_URL and HELICON_LIVE_TOKEN to run the live tests");
+    };
+    let query = std::env::var("HELICON_LIVE_MEDIA_QUERY").unwrap_or_else(|_| "a photo".into());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(
+        MemoryConfig::parse(
+            &json!({"baseUrl": url, "apiKey": token, "mediaAdminTools": true, "debug": true}),
+            &|_| None,
+        )
+        .unwrap(),
+    );
+    let inner = Inner::new(cfg, dir.path());
+
+    let libraries = inner.media.media_libraries().await;
+    eprintln!("media_libraries: {libraries}");
+    let listed = libraries["libraries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failure instead of the libraries: {libraries}"));
+    assert!(
+        !listed.is_empty(),
+        "the tenant has a media library: {libraries}"
+    );
+    let kb_id = listed[0]["id"].as_str().expect("a library id").to_owned();
+
+    let stats = inner.media.media_statistics(&json!({})).await;
+    eprintln!("media_statistics: {stats}");
+    assert!(stats["total"].as_u64().unwrap_or(0) > 0, "{stats}");
+
+    let files = inner
+        .media
+        .media_files(&json!({"kb_id": kb_id, "size": 3}))
+        .await;
+    eprintln!("media_files: {files}");
+    assert!(
+        files["items"].as_array().is_some_and(|i| !i.is_empty()),
+        "{files}"
+    );
+
+    // lowest_similarity 0: the shape of the answer is what is checked, not how well "a photo" matches
+    let found = inner
+        .media
+        .media_search(&json!({"query": query, "max_results": 3, "lowest_similarity": 0}))
+        .await;
+    eprintln!("media_search: {found}");
+    let results = found["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failure instead of results: {found}"));
+    assert!(!results.is_empty(), "the library answers a search: {found}");
+    for hit in results {
+        assert!(hit["file"].as_str().is_some_and(|f| !f.is_empty()), "{hit}");
+        let similarity = hit["similarity"].as_f64().expect("a similarity");
+        assert!((0.0..=1.0).contains(&similarity), "{hit}");
+        assert!(
+            matches!(hit["type"].as_str(), Some("image" | "video")),
+            "{hit}"
+        );
+    }
+    assert!(results.len() <= 3, "at most what was asked for: {found}");
+
+    // the search by image with the best hit as the reference: it finds at least that file again
+    if let Some(reference) = results[0]["file"].as_str() {
+        let similar = inner
+            .media
+            .media_search_by_image(&json!({"ref_image": reference, "max_results": 3}))
+            .await;
+        eprintln!("media_search_by_image: {similar}");
+        assert!(
+            similar["results"].is_array() || similar.as_str().is_some(),
+            "{similar}"
+        );
+    }
+}

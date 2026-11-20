@@ -9,7 +9,17 @@ pub(crate) const MODEL_TOOL_PREFIX: &str = "helicon__";
 pub(crate) const MAX_SEARCHES_PER_TURN: u32 = 1;
 pub(crate) const MAX_OPENS_PER_TURN: u32 = 3;
 
-/// The rules for the tools in `tool_names` (the short names: `memory_recall`, `memory_get`, ...).
+/// The usage rules of the tools in `tool_names` (the short names): the memory rules and the media rules,
+/// each only for the tools that are there. Empty when none of them is.
+pub(crate) fn agent_guidance(cfg: &MemoryConfig, tool_names: &[&str]) -> String {
+    [memory_guidance(cfg, tool_names), media_guidance(tool_names)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The rules for the memory tools in `tool_names` (`memory_recall`, `memory_get`, ...).
 /// Empty when no memory tool is among them.
 pub(crate) fn memory_guidance(cfg: &MemoryConfig, tool_names: &[&str]) -> String {
     let has = |name: &str| tool_names.contains(&name);
@@ -81,6 +91,43 @@ pub(crate) fn memory_guidance(cfg: &MemoryConfig, tool_names: &[&str]) -> String
     lines.join("\n")
 }
 
+/// The rules for `media_search` and `media_upload`. Empty when neither is among `tool_names`.
+fn media_guidance(tool_names: &[&str]) -> String {
+    let has = |name: &str| tool_names.contains(&name);
+    let t = |name: &str| format!("{MODEL_TOOL_PREFIX}{name}");
+    let (has_search, has_upload) = (has("media_search"), has("media_upload"));
+    if !(has_search || has_upload) {
+        return String::new();
+    }
+    let mut lines: Vec<String> = vec!["## Media Library (images and videos)".into()];
+    lines.push(format!(
+        "The user has a personal media library of images and videos, managed by HeliconSearch.\n\
+RULE 1 — Searching is a tool call: when the user asks to FIND, SEARCH or RETRIEVE an image or video ('find', 'search', 'show me', '找', '搜', '查找'), you MUST call {}. \
+Never answer from recalled memories or earlier context — memories about images describe files that were mentioned, not what is in the library. \
+Saying you searched without calling it is forbidden.\n\
+RULE 2 — Report what the tool returned: give the user the file path of each match you recommend (and the time span for a video), best first. \
+Do not invent files or paths.\n\
+RULE 3 — Retrieval is not generation: use an image-generation tool only when the user explicitly asks to CREATE, GENERATE or DRAW something; \
+never when they ask to find existing content.",
+        t("media_search")
+    ));
+    if has_search {
+        lines.push(format!(
+            "- {}(query): search the library for existing images and videos. Pass the user's query exactly as typed; do not translate it.",
+            t("media_search")
+        ));
+    }
+    if has_upload {
+        lines.push(format!(
+            "- {}(file_names, kb_id?): add image or video files to the library so they can be found later (use it when the user asks to add, save or index them). \
+file_names are absolute file paths on the machine HeliconSearch runs on; if a path is refused, say so instead of trying other paths or adding a directory. \
+You cannot add an image that was only attached to the conversation: ask the user for the path of the file.",
+            t("media_upload")
+        ));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +165,38 @@ mod tests {
         assert!(manual.contains("You have a long-term memory of past sessions."));
         assert!(manual.contains("Memory tools:"));
         assert!(!manual.contains("captured and extracted"));
+    }
+
+    #[test]
+    fn the_media_rules_are_given_for_the_media_tools_only() {
+        assert_eq!(media_guidance(&[]), "");
+        assert_eq!(media_guidance(&["memory_recall", "media_libraries"]), "");
+        let both = media_guidance(&["media_search", "media_upload"]);
+        assert!(both.starts_with("## Media Library (images and videos)\n"));
+        assert!(both.contains("you MUST call helicon__media_search"));
+        assert!(both.contains("- helicon__media_search(query):"));
+        assert!(both.contains("- helicon__media_upload(file_names, kb_id?):"));
+        // what this adapter cannot do is not promised
+        assert!(both.contains("cannot add an image that was only attached"));
+        assert!(!both.contains("without file_names"));
+        let search_only = media_guidance(&["media_search"]);
+        assert!(
+            search_only.contains("helicon__media_search(query)")
+                && !search_only.contains("media_upload(")
+        );
+    }
+
+    #[test]
+    fn the_agents_rules_are_the_memory_rules_then_the_media_rules() {
+        let c = cfg(json!({}));
+        assert_eq!(agent_guidance(&c, &[]), "");
+        let memory_only = agent_guidance(&c, &["memory_recall"]);
+        assert_eq!(memory_only, memory_guidance(&c, &["memory_recall"]));
+        let media_only = agent_guidance(&c, &["media_search", "media_upload"]);
+        assert!(media_only.starts_with("## Media Library"));
+        let both = agent_guidance(&c, &["memory_recall", "media_search"]);
+        assert!(both.starts_with("## Long-term Memory\n"));
+        let (memory, media) = both.split_once("\n## Media Library").unwrap();
+        assert!(!memory.contains("media_search") && media.contains("helicon__media_search(query)"));
     }
 }
