@@ -577,8 +577,11 @@ async fn a_run_that_died_moments_ago_is_ended_by_the_idle_sweep_once_it_has_been
     within(h.shutdown()).await.unwrap();
 
     // restarted at once, with a short idle limit: it is too recent to be an orphan, and is not forgotten.
-    // (Its last activity is set a few seconds ahead, so a slow machine starting the engine, up to about ten
-    // seconds, cannot make it old enough to be taken for an orphan.)
+    // The extension looks at it once the engine is up, however long that took. Starting the engine takes
+    // about ten seconds on a slow machine alone and fifteen with the rest of this file running beside it, so
+    // its last activity is set 25 seconds ahead (the idle limit is the 1 s minimum): it counts as recent
+    // for any start under 26 s, and the sweep ends it 26 s after it was written, which is the time this
+    // test takes whatever the load.
     let record = root.join(format!("state/helicon-memory/sessions/{}.json", s.id()));
     let mut saved: Value =
         serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
@@ -587,13 +590,13 @@ async fn a_run_that_died_moments_ago_is_ended_by_the_idle_sweep_once_it_has_been
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
-            + 3_000
+            + 25_000
     );
     std::fs::write(&record, saved.to_string()).unwrap();
     configure(
         &root,
         &hs,
-        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 10000}),
+        json!({"autoRecall": false, "sessionBridge": false, "idleEndMs": 1000}),
     );
     let h = start(&root).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -606,7 +609,7 @@ async fn a_run_that_died_moments_ago_is_ended_by_the_idle_sweep_once_it_has_been
             .map(|r| r.path.clone())
             .collect::<Vec<_>>()
     );
-    until("the sweep to end it", 45, || ends(&hs) == 1).await;
+    until("the sweep to end it", 60, || ends(&hs) == 1).await;
     assert_eq!(
         all(&hs, "/v1/memory/session/end")[0].body["session_id"],
         format!("openworker/{}", s.id())
