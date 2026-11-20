@@ -1004,3 +1004,22 @@ test("an id that is not a string would be another partition: refused", async () 
   assert.match(loaded.reason, /agentId must be a string/);
   await rm(dir, { recursive: true, force: true });
 });
+
+test("memory_recall lists facts the server has not verified yet, after the grounded ones", async () => {
+  const t = await attach();
+  try {
+    // some builds of the server keep a fact that was just extracted in `needs_verification`
+    t.hs.behaviour.needsVerificationOnly = true;
+    const recall = t.harness.registered[0].tools.memory_recall;
+    const text = String(await recall.execute({ query: "what do I like" }, toolCtx("s_nv", "t1")));
+    assert.match(text, /^Found 1 memories:/);
+    assert.match(text, /1\. \[needs_verification\] user likes jasmine tea \(70% id=a{32}\)/);
+    assert.doesNotMatch(text, /weak/);
+    // with a grounded fact too: that one first
+    t.hs.behaviour.needsVerificationOnly = false;
+    t.hs.behaviour.alsoUnverified = true;
+    const both = String(await recall.execute({ query: "what do I like" }, toolCtx("s_nv", "t2")));
+    assert.match(both, /1\. \[direct\] user likes teal/);
+    assert.match(both, /2\. \[needs_verification\] user likes jasmine tea/);
+  } finally { await t.done(); }
+});

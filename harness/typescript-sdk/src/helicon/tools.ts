@@ -203,15 +203,19 @@ export function registerTools(params: {
             render: "none",
           }, { deadlineMs: recallBudgets.activeDeadlineMs() });
           recallBudgets.fromResponse(resp.execution);
-          const filtered = (resp.grounded_facts ?? []).filter(
-            (f) => (f.score ?? 0) >= cfg.recallMinScore,
-          );
+          // Facts the server has not verified yet (`needs_verification`: a fact just extracted can sit there on
+          // some builds) are facts too: listed after the grounded ones, and said to be unverified.
+          const unverified = resp.needs_verification ?? [];
+          const filtered = [
+            ...(resp.grounded_facts ?? []).map((f) => ({ ...f, support_level: f.support_level as string })),
+            ...unverified.map((f) => ({ ...f, support_level: "needs_verification" })),
+          ].filter((f) => (f.score ?? 0) >= cfg.recallMinScore);
           const elapsedMs = Date.now() - started;
           // 只记录/透出可寻址的 memory_id。f.id 是本次查询现生成的临时包 id（`pkg:<12hex>`），
           // 曾被当作 memory id 截断后透给模型，导致 memory_get 必然 404。
           const ids = filtered.map((f) => pickAddressableMemoryId(f) ?? "-");
           api.logger.info(
-            `[${PLUGIN_ID}] tool=memory_recall → memories=${filtered.length} (grounded=${resp.grounded_facts?.length ?? 0}) elapsedMs=${elapsedMs} ids=[${ids.join(",")}]`,
+            `[${PLUGIN_ID}] tool=memory_recall → memories=${filtered.length} (grounded=${resp.grounded_facts?.length ?? 0}, needsVerification=${unverified.length}) elapsedMs=${elapsedMs} ids=[${ids.join(",")}]`,
           );
 
           if (filtered.length === 0) {

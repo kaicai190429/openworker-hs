@@ -64,11 +64,16 @@ export async function startFakeHelicon(behaviour = {}) {
         } });
       }
       if (p === "/v1/memory/query") {
-        const facts = behaviour.noRecall ? [] : [{ id: "pkg:abc", claim: "user likes teal", score: 0.9, support_level: "direct", source_memory_ids: [MEMORY_ID] }];
+        const facts = behaviour.noRecall || behaviour.needsVerificationOnly ? [] : [{ id: "pkg:abc", claim: "user likes teal", score: 0.9, support_level: "direct", source_memory_ids: [MEMORY_ID] }];
+        // behaviour.needsVerificationOnly / alsoUnverified: facts the server has not verified yet
+        const unverified = behaviour.needsVerificationOnly || behaviour.alsoUnverified
+          ? [{ id: "pkg:nv1", claim: "user likes jasmine tea", derived: true, score: 0.7, source_memory_ids: ["a".repeat(32)], trace_status: "none", reason: "new", possible_support: [] },
+             { id: "pkg:nv2", claim: "weak", derived: true, score: 0.0001, source_memory_ids: [], trace_status: "none", reason: "new", possible_support: [] }]
+          : [];
         // behaviour.nulInRecall: a remembered text with a NUL in it (the engine refuses a NUL in the addendum)
         const liked = behaviour.nulInRecall ? "user likes\u0000teal" : "user likes teal";
         const text = facts.length ? `## FACTS\n• ${liked}\n` : "";
-        return json(res, 200, { code: 200, grounded_facts: facts, topic_rollups: [], raw_context: [], needs_verification: [], conflicts: [], related_skills: [],
+        return json(res, 200, { code: 200, grounded_facts: facts, topic_rollups: [], raw_context: [], needs_verification: unverified, conflicts: [], related_skills: [],
           prompt_text: text,
           prompt_blocks: { protocol: "blocks.v1", blocks: facts.length ? [{ text: "## FACTS\n", ref: { type: "header" } }, { text: `• ${liked}\n`, ref: { type: "memory", memory_id: MEMORY_ID, version: "v1", extras: [] } }] : [] },
         });
