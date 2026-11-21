@@ -647,10 +647,15 @@ async fn the_model_searches_and_uploads_media_through_the_engine() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
+    // the folder the deployment lets the model add files from
+    let photos = root.join("photos");
+    std::fs::create_dir_all(&photos).unwrap();
+    let new_photo = photos.join("new.jpg").to_string_lossy().into_owned();
     configure(
         &root,
         &hs,
-        json!({"sessionBridge": false, "autoRecall": false}),
+        json!({"sessionBridge": false, "autoRecall": false,
+               "mediaUploadRoots": [photos.to_string_lossy()]}),
     );
     let model = model().await;
     let h = start(&root, &model).await;
@@ -658,7 +663,7 @@ async fn the_model_searches_and_uploads_media_through_the_engine() {
     let s = a.new_session_in(workspace(&root)).await.unwrap();
     let calls = json!([
         {"name": "helicon__media_search", "arguments": {"query": "a red car"}},
-        {"name": "helicon__media_upload", "arguments": {"file_names": ["/photos/new.jpg"]}},
+        {"name": "helicon__media_upload", "arguments": {"file_names": [new_photo.clone()]}},
     ]);
     let r = within(s.run(&format!("CALLS:{calls}"))).await.unwrap();
     assert_eq!(r.status, RunStatus::Completed, "{r:?}");
@@ -709,7 +714,7 @@ async fn the_model_searches_and_uploads_media_through_the_engine() {
     assert_eq!(search.auth.as_deref(), Some("Bearer hs_test"));
     assert_eq!(
         all(&hs, "/v1/document/upload")[0].body["file_names"],
-        json!(["/photos/new.jpg"])
+        json!([new_photo])
     );
 
     // the archive holds the conversation (the user's message names the tools: it is a script), not what the
@@ -722,6 +727,80 @@ async fn the_model_searches_and_uploads_media_through_the_engine() {
     );
     within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();
+}
+
+/// The model asks the engine to upload `file`; what the tool told it, and how many uploads reached HeliconSearch.
+async fn the_model_uploads(
+    options: Value,
+    file: &dyn Fn(&std::path::Path) -> String,
+) -> (String, usize) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    let mut config = json!({"sessionBridge": false, "autoRecall": false});
+    for (key, value) in options.as_object().unwrap() {
+        // (a folder is named by its place below the temporary folder: "$ROOT/name")
+        config[key] = match value {
+            Value::Array(list) => json!(list
+                .iter()
+                .map(|v| root
+                    .join(v.as_str().unwrap())
+                    .to_string_lossy()
+                    .into_owned())
+                .collect::<Vec<_>>()),
+            other => other.clone(),
+        };
+    }
+    for folder in ["photos", "payroll"] {
+        std::fs::create_dir_all(root.join(folder)).unwrap();
+    }
+    configure(&root, &hs, config);
+    let model = model().await;
+    let h = start(&root, &model).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+    let calls = json!([
+        {"name": "helicon__media_upload", "arguments": {"file_names": [file(&root)]}},
+    ]);
+    let r = within(s.run(&format!("CALLS:{calls}"))).await.unwrap();
+    assert_eq!(r.status, RunStatus::Completed, "{r:?}");
+    let told = tool_results(model.requests().last().unwrap()).remove(0);
+    let uploads = all(&hs, "/v1/document/upload").len();
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+    (told, uploads)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_model_cannot_upload_a_file_outside_the_allowed_folders_through_the_engine() {
+    let (told, uploads) = the_model_uploads(json!({"mediaUploadRoots": ["photos"]}), &|root| {
+        root.join("payroll")
+            .join("pay.xlsx")
+            .to_string_lossy()
+            .into_owned()
+    })
+    .await;
+    assert!(
+        told.contains("nothing was added: 1 of 1 path(s) are outside the folders"),
+        "{told}"
+    );
+    assert_eq!(uploads, 0, "the upload reached HeliconSearch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_model_cannot_upload_anything_until_a_folder_is_allowed() {
+    let (told, uploads) = the_model_uploads(json!({}), &|root| {
+        root.join("photos")
+            .join("a.jpg")
+            .to_string_lossy()
+            .into_owned()
+    })
+    .await;
+    assert!(
+        told.contains("uploading files is not enabled in this deployment"),
+        "{told}"
+    );
+    assert_eq!(uploads, 0, "the upload reached HeliconSearch");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

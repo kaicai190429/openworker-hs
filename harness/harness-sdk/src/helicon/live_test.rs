@@ -504,7 +504,9 @@ async fn live_media_upload_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Arc::new(
         MemoryConfig::parse(
-            &json!({"baseUrl": url, "apiKey": token, "mediaAdminTools": true, "debug": true}),
+            // (the folder of the file is the one `media_upload` may add from)
+            &json!({"baseUrl": url, "apiKey": token, "mediaAdminTools": true, "debug": true,
+                    "mediaUploadRoots": [std::path::Path::new(&file).parent().unwrap().to_string_lossy()]}),
             &|_| None,
         )
         .unwrap(),

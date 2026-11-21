@@ -29,6 +29,7 @@ mod history;
 mod live_test;
 mod log;
 mod media;
+mod media_paths;
 mod memory_context;
 #[cfg(test)]
 mod real_shapes;
@@ -182,6 +183,18 @@ impl Inner {
         short_names.extend(media::tool_names(&cfg));
         if cfg.auto_media && cfg.media_inline_images {
             logger.warn("[helicon-memory] mediaInlineImages is not supported by this adapter (the result of an application tool cannot carry an image): media_search answers with file paths only");
+        }
+        if cfg.auto_media {
+            if cfg.media_upload_roots.is_empty() {
+                logger.info(
+                    "[helicon-memory] media_upload adds nothing: mediaUploadRoots names no folder",
+                );
+            } else {
+                logger.info(&format!(
+                    "[helicon-memory] media_upload may add files from {} folder(s) (mediaUploadRoots)",
+                    cfg.media_upload_roots.len()
+                ));
+            }
         }
         Arc::new(Self {
             tools: Tools::new(cfg.clone(), client.clone(), logger.clone(), budgets.clone()),

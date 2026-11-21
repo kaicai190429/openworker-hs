@@ -151,7 +151,7 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
 | `closeWaitMs` | `0` (0–300000) | How long `close()` waits for HeliconSearch's answer to this session's extraction request (see below). |
 | `replaceBuiltinMemory` | `true` | Agents get the HeliconSearch tools instead of the engine's built-in `memory_*` tools. |
 | `memoryStoreTool` | `false` | Also give agents a `memory_store` tool. |
-| `autoMedia` | `true` | Give agents the media tools `media_search` and `media_upload`. |
+| `autoMedia` | `true` | Give agents the media tools `media_search` and `media_upload` (`media_upload` adds nothing until `mediaUploadRoots` names a folder). |
 | `mediaAdminTools` | `false` | Also `media_search_by_image`, `media_libraries`, `media_files` and `media_statistics`. |
 | `mediaMaxResults` | `5` (1–100) | Results of `media_search` when the model does not say (a call asks for at most 50). |
 | `mediaSearchMode` | `2` (0–3) | How HeliconSearch searches: `2` is the VLM + CLIP hybrid. |
@@ -159,6 +159,7 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
 | `mediaKbId` | `""` | The library `media_upload`, `media_files` and `media_statistics` use when none is named; empty: the one HeliconSearch picks for the tenant. |
 | `mediaRerankModel` | `BGE` | The reranker HeliconSearch applies to a media search. |
 | `mediaInlineImages` | `false` | Read, because the TypeScript SDK shares the file; not supported here (a warning is logged when it is on). |
+| `mediaUploadRoots` | `[]` | The folders `media_upload` may add files from, as absolute paths (`${VAR}` is read from the environment, at most 50). Empty: `media_upload` adds nothing. See [Which paths `media_upload` accepts](#which-paths-media_upload-accepts). |
 | `topK` | `5` (1–50) | Default number of results of `memory_recall`. |
 | `recallTopK` | `12` (1–20) | Memories requested for the automatic recall of a turn. |
 | `recallMinScore` | `0.01` (0–1) | Floor below which a recalled fact is not shown. |
@@ -186,7 +187,8 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
   the agent's `tools` and `instructions` (and turns its `memory` off). An agent id is immutable, so these settings are
   part of the agent: changing `memoryStoreTool`, `autoMedia`, `mediaAdminTools`, `autoRecall`, `autoCapture`,
   `replaceBuiltinMemory` or `agents` in the
-  file, turning memory on for an agent that exists without it, or upgrading the SDK (the usage note may be reworded)
+  file (`mediaUploadRoots` is not one of them: it is read when the extension starts, and changing it needs a restart
+  but no new agent id), turning memory on for an agent that exists without it, or upgrading the SDK (the usage note may be reworded)
   makes `create_agent` fail with a definition conflict for that id. The SDK says so on stderr; register the agent under
   a new id (`assistant-v2`). Sessions of an agent registered before memory existed still get recall and capture, only
   not the tools.
@@ -269,6 +271,32 @@ token as memory, and port `media-tools.ts` of the TypeScript adapter.
 A result is a small JSON object the model reads and an application can render: `results[]` with `file`, `type`,
 `similarity` and, for a video, `startSeconds` / `endSeconds`. A failure is a text, as with the memory tools. File paths
 are paths on the machine HeliconSearch runs on: it reads the files itself.
+
+### Which paths `media_upload` accepts
+
+HeliconSearch reads and indexes whatever path it is given (a folder is walked; images, videos and documents are
+indexed), as the user it runs as, and a search then returns what it read. A model that was talked into naming a
+payroll folder would get it indexed, so `media_upload` accepts only paths inside the folders of `mediaUploadRoots`,
+and **adds nothing while that list is empty** (the default). The application that starts the harness sets it, in
+`helicon-memory.json`, before the harness starts (the file is read once, when the extension starts):
+
+```json
+{ "mediaUploadRoots": ["/data/media", "${HELICON_MEDIA_ROOT}"] }
+```
+
+- A path is judged by where it really is on this machine: a symlink inside a folder that points out of it does not
+  count. A path with `..` in it is refused (a file system, not the text, decides where `link/..` goes). A relative
+  path is refused. A folder is accepted when it is inside a root, or is one.
+- A root need not exist yet (it may be mounted later); its own `..` is resolved. Windows paths are compared without
+  regard to case.
+- Every path of a call is checked before anything is sent, and one that is outside refuses the whole call: nothing
+  is added. The answer says how many paths were refused and shows the first, not which folders are allowed. The
+  tool's text and the usage note in the agent's instructions do not mention the setting (they are part of the agent
+  definition), so adding or changing roots never needs a new agent id.
+- The check is made on the machine the extension runs on. With HeliconSearch on another machine the path is judged by
+  its text (the part that does not exist here), so keep both on the same system or limit the roots there too.
+  HeliconSearch reads the path some time after the check: the allowlist keeps a model from naming a path, it is not a
+  sandbox. The agent's approval mode (`Approvals`) still applies to the call, as to every application tool.
 
 ## The extension seam
 

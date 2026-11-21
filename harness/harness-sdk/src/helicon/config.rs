@@ -85,6 +85,8 @@ pub(crate) struct MemoryConfig {
     /// Read for the file the TypeScript SDK shares; not supported here (the result of an application tool
     /// cannot carry an image).
     pub media_inline_images: bool,
+    /// The folders `media_upload` may add files from, as absolute paths. Empty (the default): it adds nothing.
+    pub media_upload_roots: Vec<String>,
     pub capture_mode: CaptureMode,
     pub capture_max_chars: usize,
     pub store_gate: bool,
@@ -151,6 +153,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "mediaRerankModel",
     "mediaMinSimilarity",
     "mediaInlineImages",
+    "mediaUploadRoots",
     "sessionBridge",
     "sessionBridgeEpisodicLimit",
     "sessionBridgePinnedMinImportance",
@@ -298,6 +301,34 @@ fn agent_names(raw: Option<&Value>) -> Result<Option<Vec<String>>, String> {
     Ok(Some(out))
 }
 
+/// `mediaUploadRoots`: absolute folder paths (`${VAR}` is read from the environment). A folder need not exist
+/// yet: it may be mounted later, so only the form is checked here.
+fn upload_roots(raw: Option<&Value>, env: Env) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let list = raw
+        .as_array()
+        .ok_or("mediaUploadRoots must be an array of absolute folder paths")?;
+    if list.len() > 50 {
+        return Err("mediaUploadRoots must include at most 50 entries".into());
+    }
+    let mut out = Vec::new();
+    for (i, item) in list.iter().enumerate() {
+        let text = item
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| format!("mediaUploadRoots.{i} must be a non-empty string"))?;
+        let path = resolve_env(text, env)?.trim().to_owned();
+        if !std::path::Path::new(&path).is_absolute() {
+            return Err(format!("mediaUploadRoots.{i} must be an absolute path"));
+        }
+        out.push(path);
+    }
+    Ok(out)
+}
+
 fn custom_triggers(raw: Option<&Value>) -> Result<Option<Vec<String>>, String> {
     let Some(raw) = raw else { return Ok(None) };
     let list = raw
@@ -398,6 +429,7 @@ impl MemoryConfig {
                 .to_owned(),
             media_min_similarity: float("mediaMinSimilarity", 0.0, 1.0, 0.05)?,
             media_inline_images: boolean(get("mediaInlineImages"), false)?,
+            media_upload_roots: upload_roots(get("mediaUploadRoots"), env)?,
             capture_mode: capture_mode(get("captureMode"))?,
             capture_max_chars: int(
                 "captureMaxChars",
@@ -555,5 +587,31 @@ mod tests {
             MemoryConfig::parse(&json!({"baseUrl":"http://h","mediaRerankModel":"  "}), &env)
                 .unwrap();
         assert_eq!(blank.media_rerank_model, "BGE");
+    }
+
+    #[test]
+    fn the_upload_folders_default_to_none_and_are_read_and_checked() {
+        let none = MemoryConfig::parse(&json!({"baseUrl":"http://h"}), &env).unwrap();
+        assert!(none.media_upload_roots.is_empty());
+        let abs = std::env::temp_dir().to_string_lossy().into_owned();
+        let cfg = MemoryConfig::parse(
+            &json!({"baseUrl":"http://h","mediaUploadRoots":[format!("  {abs}  "), "${ROOT}"]}),
+            &|name| (name == "ROOT").then(|| abs.clone()),
+        )
+        .unwrap();
+        assert_eq!(cfg.media_upload_roots, vec![abs.clone(), abs.clone()]);
+        let bad = |roots: Value| {
+            MemoryConfig::parse(
+                &json!({"baseUrl":"http://h","mediaUploadRoots":roots}),
+                &env,
+            )
+            .unwrap_err()
+        };
+        assert!(bad(json!("/data")).contains("must be an array of absolute folder paths"));
+        assert!(bad(json!([abs, 5])).contains("mediaUploadRoots.1 must be a non-empty string"));
+        assert!(bad(json!(["  "])).contains("mediaUploadRoots.0 must be a non-empty string"));
+        assert!(bad(json!(["data/media"])).contains("mediaUploadRoots.0 must be an absolute path"));
+        assert!(bad(json!(["${NOT_SET}"])).contains("Environment variable NOT_SET is not set"));
+        assert!(bad(json!(vec![abs; 51])).contains("at most 50 entries"));
     }
 }

@@ -20,10 +20,15 @@
 //!
 //! Paths are paths on the machine HeliconSearch runs on: it reads the files itself, so a library can only be
 //! fed files HeliconSearch can open.
+//!
+//! HeliconSearch reads and indexes whatever path it is given, so `media_upload` adds only files inside the
+//! folders of `mediaUploadRoots`. None is allowed by default: it adds nothing until the application names
+//! them (see `media_paths` for how a path is judged).
 use super::{
     client::{HeliconClient, HsError, HsResult},
     config::MemoryConfig,
     log::Logger,
+    media_paths::upload_path_allowed,
     tools::{capped, MAX_TOOL_OUTPUT_BYTES},
     util::cut_bytes,
 };
@@ -349,6 +354,28 @@ impl MediaTools {
             .unwrap_or_default();
         if files.is_empty() {
             return text("media_upload: file_names is required: the absolute paths of the files to add, on the machine HeliconSearch runs on. An image that was only attached to the conversation cannot be added: ask the user for its path.");
+        }
+        // (the tool's text and schema say nothing of this: they are part of the agent's definition)
+        let roots = &self.cfg.media_upload_roots;
+        if roots.is_empty() {
+            return text("media_upload: uploading files is not enabled in this deployment (it has no folder allowed for it). Tell the user the files cannot be added.");
+        }
+        let outside: Vec<&String> = files
+            .iter()
+            .filter(|file| !upload_path_allowed(file, roots))
+            .collect();
+        if let Some(first) = outside.first() {
+            let shown: String = first.chars().take(200).collect();
+            self.logger.warn(&format!(
+                "{TAG} tool=media_upload refused {} of {} path(s) outside mediaUploadRoots, the first: {shown:?}",
+                outside.len(),
+                files.len()
+            ));
+            return text(format!(
+                "media_upload: nothing was added: {} of {} path(s) are outside the folders this deployment allows for upload (for example {shown}). Ask the user for files inside an allowed folder; do not try other paths.",
+                outside.len(),
+                files.len()
+            ));
         }
         let given = text_arg(args, "kb_id");
         let kb_id = if !given.is_empty() {
@@ -895,22 +922,43 @@ mod tests {
         );
     }
 
+    /// A folder `media_upload` may add from, its path, and the options that allow it.
+    fn upload_root() -> (tempfile::TempDir, String, Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let options = json!({"mediaUploadRoots": [root.clone()]});
+        (dir, root, options)
+    }
+
+    fn below(root: &str, name: &str) -> String {
+        std::path::Path::new(root)
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[tokio::test]
     async fn upload_adds_the_files_to_the_library_the_server_names() {
-        let hs = MockHs::start(|req| match req.path.as_str() {
+        let (_dir, root, options) = upload_root();
+        let a = below(&root, "a.jpg");
+        // (a path is passed on as it was written, not as it was judged)
+        let sep = std::path::MAIN_SEPARATOR;
+        let b = format!("{root}{sep}.{sep}b.png");
+        let expected = json!([a.clone(), b.clone()]);
+        let hs = MockHs::start(move |req| match req.path.as_str() {
             "/v1/kb/resolve_default" => {
                 media(json!({"kb_id": "kb1", "name": "photos", "created": false, "doc_count": 3}))
             }
             "/v1/document/upload" => {
                 assert_eq!(req.body["kb_id"], "kb1");
-                assert_eq!(req.body["file_names"], json!(["/p/a.jpg", "/p/b.png"]));
+                assert_eq!(req.body["file_names"], expected);
                 media(json!({"batch_id": "b1"}))
             }
             other => panic!("unexpected {other}"),
         })
         .await;
-        let out = tools(&hs, json!({}))
-            .media_upload(&json!({"file_names": ["/p/a.jpg", "  ", "/p/b.png"]}))
+        let out = tools(&hs, options)
+            .media_upload(&json!({"file_names": [a, "  ", b]}))
             .await;
         let message = out["message"].as_str().unwrap();
         assert!(
@@ -923,16 +971,19 @@ mod tests {
 
     #[tokio::test]
     async fn upload_uses_the_library_it_is_told_without_asking_the_server_to_choose() {
-        for (extra, args) in [
+        let (_dir, root, options) = upload_root();
+        let file = below(&root, "a.jpg");
+        for (mut extra, args) in [
             (
                 json!({}),
-                json!({"file_names": ["/a.jpg"], "kb_id": "mine"}),
+                json!({"file_names": [file.clone()], "kb_id": "mine"}),
             ),
             (
                 json!({"mediaKbId": "mine"}),
-                json!({"file_names": ["/a.jpg"]}),
+                json!({"file_names": [file.clone()]}),
             ),
         ] {
+            extra["mediaUploadRoots"] = options["mediaUploadRoots"].clone();
             let hs = MockHs::start(|req| {
                 assert_eq!(req.path, "/v1/document/upload", "no library to resolve");
                 assert_eq!(req.body["kb_id"], "mine");
@@ -955,7 +1006,8 @@ mod tests {
             _ => refused("cannot read /nope.jpg"),
         })
         .await;
-        let t = tools(&hs, json!({}));
+        let (_dir, root, options) = upload_root();
+        let t = tools(&hs, options.clone());
         let none = t.media_upload(&json!({})).await;
         assert!(
             none.as_str().unwrap().contains("file_names is required")
@@ -963,7 +1015,9 @@ mod tests {
             "{none}"
         );
         assert!(hs.requests().is_empty());
-        let out = t.media_upload(&json!({"file_names": ["/nope.jpg"]})).await;
+        let out = t
+            .media_upload(&json!({"file_names": [below(&root, "nope.jpg")]}))
+            .await;
         let said = out.as_str().unwrap();
         assert!(
             said.starts_with("media_upload failed:") && said.contains("cannot read /nope.jpg"),
@@ -971,8 +1025,8 @@ mod tests {
         );
 
         let no_library = MockHs::start(|_| refused("no tenant")).await;
-        let out = tools(&no_library, json!({}))
-            .media_upload(&json!({"file_names": ["/a.jpg"]}))
+        let out = tools(&no_library, options)
+            .media_upload(&json!({"file_names": [below(&root, "a.jpg")]}))
             .await;
         assert!(
             out.as_str()
@@ -980,6 +1034,63 @@ mod tests {
                 .starts_with("media_upload: could not resolve a target library:"),
             "{out}"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_adds_nothing_while_no_folder_is_allowed() {
+        let hs = MockHs::start(|req| panic!("a request went to HeliconSearch: {}", req.path)).await;
+        let file = std::env::temp_dir()
+            .join("a.jpg")
+            .to_string_lossy()
+            .into_owned();
+        // no option at all, and an empty list, are the same
+        for extra in [json!({}), json!({"mediaUploadRoots": []})] {
+            let out = tools(&hs, extra)
+                .media_upload(&json!({"file_names": [file.clone()]}))
+                .await;
+            let said = out.as_str().unwrap();
+            assert!(
+                said.contains("uploading files is not enabled in this deployment")
+                    && said.contains("the files cannot be added"),
+                "{said}"
+            );
+        }
+        assert!(hs.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_adds_nothing_when_one_path_is_outside_the_allowed_folders() {
+        let hs = MockHs::start(|req| panic!("a request went to HeliconSearch: {}", req.path)).await;
+        let (_dir, root, options) = upload_root();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere
+            .path()
+            .join("payroll.xlsx")
+            .to_string_lossy()
+            .into_owned();
+        let t = tools(&hs, options);
+        let out = t
+            .media_upload(&json!({"file_names": [below(&root, "a.jpg"), outside.clone()]}))
+            .await;
+        let said = out.as_str().unwrap();
+        assert!(
+            said.starts_with(
+                "media_upload: nothing was added: 1 of 2 path(s) are outside the folders"
+            ) && said.contains(&format!("for example {outside}")),
+            "{said}"
+        );
+        // the answer does not say which folders are allowed
+        assert!(!said.contains(&root), "{said}");
+        // a relative path and a path that climbs out are outside as well
+        let sep = std::path::MAIN_SEPARATOR;
+        for path in ["a.jpg".to_owned(), format!("{root}{sep}..{sep}a.jpg")] {
+            let out = t.media_upload(&json!({"file_names": [path]})).await;
+            assert!(
+                out.as_str().unwrap().contains("1 of 1 path(s) are outside"),
+                "{out}"
+            );
+        }
+        assert!(hs.requests().is_empty());
     }
 
     #[tokio::test]
