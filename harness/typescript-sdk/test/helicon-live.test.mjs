@@ -103,11 +103,13 @@ test("media: an attached image is added to the library, found by a text query, a
   process.env.HELICON_LIVE_KEY = token;
   const model = await startMockModel();
   const stateDir = await mkdtemp(join(tmpdir(), "ow-helicon-live-media-"));
-  await writeFile(join(stateDir, "helicon-memory.json"), JSON.stringify({
-    baseUrl: url, apiKey: "${HELICON_LIVE_KEY}", agentId: `live-${randomUUID().slice(0, 8)}`, captureMode: "direct", mediaInlineImages: true, mediaAdminTools: true,
-  }));
   const srcDir = await mkdtemp(join(tmpdir(), "ow-helicon-live-img-"));
   await mkdir(srcDir, { recursive: true });
+  // media_upload adds a named path only from a folder the configuration allows
+  await writeFile(join(stateDir, "helicon-memory.json"), JSON.stringify({
+    baseUrl: url, apiKey: "${HELICON_LIVE_KEY}", agentId: `live-${randomUUID().slice(0, 8)}`, captureMode: "direct", mediaInlineImages: true, mediaAdminTools: true,
+    mediaUploadRoots: [srcDir],
+  }));
   const bluePath = join(srcDir, `blue-${randomUUID().slice(0, 6)}.png`).split("\\").join("/");
   await writeFile(bluePath, colourPng([20, 40, 230]));
 

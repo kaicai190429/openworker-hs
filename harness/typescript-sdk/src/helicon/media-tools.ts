@@ -14,11 +14,13 @@
  * the model (one JPEG/PNG, as the SDK's tool images allow) so it can check what it found.
  *
  * Paths are paths on the machine HeliconSearch runs on: it reads the files itself, so a library
- * can only be fed files HeliconSearch can open.
+ * can only be fed files HeliconSearch can open. media_upload adds only paths inside a folder of
+ * `mediaUploadRoots` (none by default; see media-path-policy.ts).
  */
 import { readFile, stat } from "node:fs/promises";
 import { extname } from "node:path";
 import type { MemoryConfig } from "./config.js";
+import { isUploadPathAllowed } from "./media-path-policy.js";
 import type { HeliconMediaClient, KbInfo, SearchResultItem } from "./media-client.js";
 import type { ToolCtx, ToolHost, ToolResult } from "./tools.js";
 
@@ -208,6 +210,25 @@ export function registerMediaTools(params: {
           return result("media_upload: no file_names given and the user has attached no images in this conversation.");
         }
         log(`tool=media_upload using ${files.length} attached image(s)`);
+      } else {
+        // Paths the model names: only inside the folders the deployment allows, all of them or nothing.
+        // (The attached images above are the adapter's own files in its uploads directory.) The tool's
+        // description and the agent's guidance stay as they are, so the explanation is in the refusal.
+        if (cfg.mediaUploadRoots.length === 0) {
+          return result(
+            "media_upload: uploading files is not enabled in this deployment (it has no folder allowed for it). " +
+            "Tell the user the files cannot be added.",
+          );
+        }
+        const refused = files.filter((f) => !isUploadPathAllowed(f, cfg.mediaUploadRoots));
+        if (refused.length > 0) {
+          const first = refused[0]!.slice(0, 200);
+          api.logger.warn(`[${PLUGIN_ID}] tool=media_upload refused ${refused.length} of ${files.length} path(s); first: ${JSON.stringify(first)}`);
+          return result(
+            `media_upload: nothing was added: ${refused.length} of ${files.length} path(s) are outside the folders this deployment allows for upload ` +
+            `(for example ${first}). Ask the user for files inside an allowed folder; do not try other paths.`,
+          );
+        }
       }
       try {
         let kbId = p.kb_id || cfg.mediaKbId;

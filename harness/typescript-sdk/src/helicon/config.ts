@@ -5,6 +5,7 @@
  * keeps error messages explicit and avoids pulling typebox runtime into the
  * config layer. Tool parameter schemas in index.ts still use typebox.
  */
+import { isAbsolute } from "node:path";
 
 export const MEMORY_CATEGORIES = [
   "preference",
@@ -158,6 +159,8 @@ export type MemoryConfig = {
   idleEndMs: number;
   /** media_search also shows the best image hit to the model (one JPEG/PNG; needs a vision model) */
   mediaInlineImages: boolean;
+  /** absolute folders media_upload may add files from (named files and folders); empty: it refuses every path */
+  mediaUploadRoots: string[];
   /** only agents of these names get memory; absent: every agent of the harness */
   agents?: string[];
 };
@@ -205,6 +208,7 @@ const ALLOWED_KEYS = [
   "idleEndMs",
   "agents",
   "mediaInlineImages",
+  "mediaUploadRoots",
 ] as const;
 
 function assertAllowedKeys(value: Record<string, unknown>): void {
@@ -314,6 +318,31 @@ function parseAgentNames(raw: unknown): string[] | undefined {
   }
   if (raw.length > 100) throw new Error("agents must list at most 100 names");
   return raw.map((n: string) => n.trim());
+}
+
+/**
+ * Folders media_upload may add from. Default none. Only the form is checked: the folder need not exist
+ * yet (it may be mounted later, or live on the HeliconSearch machine).
+ */
+function parseUploadRoots(raw: unknown): string[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error("mediaUploadRoots must be an array of absolute folder paths");
+  }
+  const out = raw.map((entry, index) => {
+    if (typeof entry !== "string" || !entry.trim()) {
+      throw new Error(`mediaUploadRoots.${index} must be a non-empty string`);
+    }
+    const resolved = resolveEnvVars(entry.trim()).trim();
+    if (!isAbsolute(resolved)) {
+      throw new Error(`mediaUploadRoots.${index} must be an absolute path`);
+    }
+    return resolved;
+  });
+  if (out.length > 50) {
+    throw new Error("mediaUploadRoots must include at most 50 entries");
+  }
+  return out;
 }
 
 function parseCustomTriggers(raw: unknown): string[] | undefined {
@@ -448,6 +477,7 @@ export const memoryConfigSchema = {
     // Media tools fields
     const autoMedia = parseBoolean(cfg.autoMedia, DEFAULT_AUTO_MEDIA);
     const mediaInlineImages = parseBoolean(cfg.mediaInlineImages, false);
+    const mediaUploadRoots = parseUploadRoots(cfg.mediaUploadRoots);
     const mediaAdminTools = parseBoolean(cfg.mediaAdminTools, DEFAULT_MEDIA_ADMIN_TOOLS);
     const mediaMaxResults = parseIntInRange(
       cfg.mediaMaxResults,
@@ -560,6 +590,7 @@ export const memoryConfigSchema = {
       idleEndMs,
       ...(agents ? { agents } : {}),
       mediaInlineImages,
+      mediaUploadRoots,
     };
   },
 };

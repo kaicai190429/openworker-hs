@@ -99,6 +99,7 @@ with `--env HELICON_TENANT_TOKEN` and supply the variable to the application.
 | `autoMedia` | `true` | Give agents the media tools. |
 | `mediaAdminTools` | `false` | Also `media_search_by_image`, `media_libraries`, `media_files`, `media_statistics`. |
 | `mediaInlineImages` | `false` | `media_search` also shows the best image hit to the model (needs a vision model). |
+| `mediaUploadRoots` | `[]` | Absolute folders `media_upload` may add files from (at most 50; `${VAR}` is substituted). Empty: it refuses every path the agent names. See "Media search and upload". |
 | `mediaMaxResults`, `mediaMinSimilarity`, `mediaKbId`, … | see `config.ts` | Media search tuning and a fixed target library. |
 | `recallTopK`, `recallMinScore`, `recallMaxChars`, `recallGate`, `storeGate` | see `config.ts` | Recall and extraction tuning, as in the OpenClaw plugin. |
 | `debug` | `false` | Log every request to `<stateDir>/helicon-memory/adapter.log` (warnings are always logged). |
@@ -123,6 +124,37 @@ attached images under `<stateDir>/helicon-memory/uploads/` and adds those. Index
 are searchable when it finishes (`media_statistics` shows progress).
 
 Audio and video cannot be attached to a message in the SDK, so only files already on disk (by path) can be added.
+
+### Which paths `media_upload` accepts
+
+HeliconSearch indexes whatever it is given (images, videos and documents such as PDF or Excel, a whole folder
+included), as its own OS user, and `media_search` then returns what it found. So a path the agent names is only
+passed on when it is inside a folder you list in `mediaUploadRoots`; the default is none, and `media_upload`
+then answers that uploading is not enabled and does nothing.
+
+```json
+{ "mediaUploadRoots": ["/data/media", "${MEDIA_SHARE}/clips"] }
+```
+
+- Every entry is an absolute path (checked when the configuration is read; the folder need not exist yet).
+- The files, or folders, the agent names must equal an allowed folder or lie inside it, by whole path components
+  (`/data/media-evil/x` is not inside `/data/media`). Symbolic links in the part of the path that exists on the
+  machine the adapter runs on are resolved, so a link inside an allowed folder that points out of it does not lead
+  out. On Windows the comparison ignores case and accepts `/` and `\`.
+- A path with a `..` segment is refused, even where it would stay inside the folder (a link followed by `..` goes
+  somewhere else than the text says). A `..` in an entry of `mediaUploadRoots` itself is resolved: `/data/media/trip/..`
+  is `/data/media`.
+- All or nothing: if one of several paths is outside, none is added, and the agent is told only that and how many
+  were outside, not which folders are allowed. The refusal is also written to the adapter log.
+- The images the user attached to a message are not affected: with no `file_names` the agent adds the images the
+  adapter saved itself, whatever `mediaUploadRoots` holds.
+- The path is passed to HeliconSearch as the agent gave it. The check happens on the machine the adapter runs on,
+  and HeliconSearch opens the path later: when HeliconSearch runs on another machine the check can only compare the
+  text of the path (nothing there can be resolved), and a file swapped for a link after the check is not caught.
+  It is a guard against the model naming a path, not a sandbox. Allow only folders HeliconSearch may read for
+  this tenant.
+- The tool's description and the agent's usage note do not change with this option (they are stored with the agent
+  definition), so the explanation is in what the tool answers.
 
 ## What to know
 
@@ -169,8 +201,11 @@ Audio and video cannot be attached to a message in the SDK, so only files alread
 ## Safety
 
 - **Approve the tools that act.** `media_upload` makes HeliconSearch read files you name from its own disk, and a
-  model can be talked into naming the wrong ones (a directory included); `memory_forget` deletes. With the default
+  model can be talked into naming the wrong ones (a directory included; `mediaUploadRoots` limits where); `memory_forget` deletes. With the default
   approval mode the user is asked each time. If you turn approvals off for an agent, think about these two first.
+- **`media_upload` adds nothing from outside `mediaUploadRoots`.** The default is no folder at all. List only
+  folders whose contents you are willing to have indexed and read back through `media_search`; never a home
+  directory or a drive root, and not a folder with documents you would not show the agent.
 - **Memory is shared by everyone who shares the token.** One tenant, one pool of memories and media.
 - **Only `agents` named in the configuration are touched**, so an application with several agents can keep, say, a
   coding agent's conversations out of HeliconSearch.

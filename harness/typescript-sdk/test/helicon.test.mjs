@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { loadHeliconConfig } from "../dist/helicon/config-file.js";
+import { isUploadPathAllowed } from "../dist/helicon/media-path-policy.js";
 import { adaptItem, toMessages, readHistory } from "../dist/helicon/history.js";
 import { SessionStore } from "../dist/helicon/session-store.js";
 import { HeliconAdapter } from "../dist/helicon/adapter.js";
@@ -580,16 +581,18 @@ test("media_search with nothing found, and when HeliconSearch refuses, answers i
 });
 
 test("media_upload adds the given paths, or the images the user attached, to the default library", async () => {
-  const t = await attach();
+  const photos = mkdtempSync(join(tmpdir(), "ow-helicon-photos-"));
+  const t = await attach({}, { mediaUploadRoots: [photos] });
   try {
     const upload = t.harness.registered[0].tools.media_upload;
     const none = await upload.execute({}, toolCtx("s_none"));
     assert.match(none, /attached no images/);
 
-    const byPath = await upload.execute({ file_names: ["/photos/a.jpg", "/photos/b.jpg"] }, toolCtx());
+    const names = [`${photos}${sep}a.jpg`, `${photos}${sep}b.jpg`];
+    const byPath = await upload.execute({ file_names: names }, toolCtx());
     assert.equal(byPath.library, "kb1");
     const call = t.hs.calls.filter((c) => c.path === "/v1/document/upload").at(-1);
-    assert.deepEqual(call.body, { kb_id: "kb1", file_names: ["/photos/a.jpg", "/photos/b.jpg"] });
+    assert.deepEqual(call.body, { kb_id: "kb1", file_names: names });
     assert.ok(t.hs.calls.some((c) => c.path === "/v1/kb/resolve_default"), "the server picks the library");
 
     // an image attached to a message is kept on disk and added without the user giving a path
@@ -605,9 +608,10 @@ test("media_upload adds the given paths, or the images the user attached, to the
 });
 
 test("media_upload reports a refused upload instead of throwing", async () => {
-  const t = await attach({ uploadFails: true });
+  const photos = mkdtempSync(join(tmpdir(), "ow-helicon-photos-"));
+  const t = await attach({ uploadFails: true }, { mediaUploadRoots: [photos] });
   try {
-    const out = await t.harness.registered[0].tools.media_upload.execute({ file_names: ["/nope.jpg"] }, toolCtx());
+    const out = await t.harness.registered[0].tools.media_upload.execute({ file_names: [`${photos}${sep}nope.jpg`] }, toolCtx());
     assert.match(out, /no valid file path/);
   } finally { await t.done(); }
 });
@@ -638,6 +642,308 @@ test("the agent is told about the media tools", async () => {
     assert.match(instructions, /## Media Library/);
     assert.match(instructions, /helicon__media_search/);
     assert.match(instructions, /helicon__media_upload/);
+  } finally { await t.done(); }
+});
+
+// ── media_upload: folders it may add from (mediaUploadRoots) ───────────────────
+
+/** <tmp>/media (with a/b files and a sub folder), <tmp>/media-evil and <tmp>/outside: the folder names a prefix trick would use. */
+function policyTree() {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "ow-helicon-policy-")));
+  const dirs = { base, root: join(base, "media"), sub: join(base, "media", "sub"), evil: join(base, "media-evil"), outside: join(base, "outside") };
+  for (const dir of [dirs.sub, dirs.evil, dirs.outside]) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dirs.root, "a.jpg"), "a");
+  writeFileSync(join(dirs.sub, "b.jpg"), "b");
+  writeFileSync(join(dirs.outside, "secret.txt"), "s");
+  return dirs;
+}
+
+/** A directory link: a symlink, or a junction where Windows refuses an unprivileged symlink. False when the OS allows neither (EPERM). */
+function linkDir(target, link) {
+  for (const kind of process.platform === "win32" ? ["dir", "junction"] : ["dir"]) {
+    try { symlinkSync(target, link, kind); return true; } catch (err) { if (err.code !== "EPERM") throw err; }
+  }
+  return false;
+}
+
+test("an upload path is allowed in a root folder or inside it, by whole path components", () => {
+  const { base, root, sub, evil, outside } = policyTree();
+  const ok = (p, roots = [root]) => assert.equal(isUploadPathAllowed(p, roots), true, `allowed: ${p}`);
+  const no = (p, roots = [root]) => assert.equal(isUploadPathAllowed(p, roots), false, `refused: ${p}`);
+
+  ok(join(root, "a.jpg"));
+  ok(root, [root]);
+  ok(sub);
+  ok(join(sub, "b.jpg"));
+  ok(`${root}${sep}`);
+  ok(`${root}${sep}.${sep}a.jpg`);
+  ok(`${root}${sep}${sep}sub${sep}b.jpg`);
+  ok(join(root, "..hidden"));
+  ok(join(root, "a..b.jpg"));
+  ok(join(root, "a.jpg").split(sep).join("/"));
+  ok(join(root, "a.jpg"), [`${root}${sep}`]);
+  ok(join(sub, "b.jpg"), [`${root}${sep}`]);
+  ok(join(outside, "x"), [root, outside]);
+
+  no(join(evil, "x"));
+  no(evil);
+  no(`${root}${sep}..${sep}outside${sep}x`);
+  // a ".." segment is refused even where the path stays inside the folder, in any spelling
+  no(`${root}${sep}sub${sep}..${sep}a.jpg`);
+  no(`${root.split(sep).join("/")}/sub/../a.jpg`);
+  no(`${root}\sub\..\a.jpg`);
+  no(`${sub}${sep}..`);
+  no(`${root}${sep}..`);
+  no(`${root}${sep}sub${sep}..${sep}..${sep}outside${sep}secret.txt`);
+  no(join(outside, "secret.txt"));
+  no(base);
+  for (const relative of ["a.jpg", `.${sep}a.jpg`, `media${sep}a.jpg`, "~/a.jpg", ""]) no(relative);
+  no(`${join(root, "a.jpg")}\0`);
+  no(join(root, "a.jpg"), []);
+  no(root, []);
+  no(undefined);
+  no(42);
+
+  // not there yet, or not on this machine at all: judged on the text and the part that exists
+  ok(join(root, "new", "deeper", "not-there.jpg"));
+  no(join(base, "nowhere", "x.jpg"));
+  const missing = join(base, "not-mounted");
+  ok(join(missing, "a.jpg"), [missing]);
+  ok(missing, [missing]);
+  no(`${missing}-2${sep}a.jpg`, [missing]);
+  no(join(base, "other", "a.jpg"), [missing]);
+
+  // a ".." in a root (the operator's own text) is resolved: each of these roots is <tmp>/media
+  for (const trip of [`${root}${sep}trip${sep}..`, `${sub}${sep}..`]) {
+    ok(join(root, "a.jpg"), [trip]);
+    ok(join(sub, "b.jpg"), [trip]);
+    no(join(evil, "x"), [trip]);
+    no(join(outside, "secret.txt"), [trip]);
+    no(base, [trip]);
+  }
+
+  // a root that is not an absolute path, or not a string, never matches
+  no(join(root, "a.jpg"), ["media"]);
+  no(join(root, "a.jpg"), [""]);
+  no(join(root, "a.jpg"), [42]);
+});
+
+test("a link inside a root that leads out of it is not followed out; a linked root works", (t) => {
+  const { base, root, sub, evil, outside } = policyTree();
+  if (!linkDir(outside, join(root, "link"))) return t.skip("the OS refused to create a link (EPERM)");
+  assert.equal(linkDir(root, join(base, "rootlink")), true);
+  assert.equal(linkDir(sub, join(base, "shortcut")), true);
+
+  // the link is in the root, its target is not
+  assert.equal(isUploadPathAllowed(join(root, "link", "secret.txt"), [root]), false);
+  assert.equal(isUploadPathAllowed(join(root, "link"), [root]), false);
+  assert.equal(isUploadPathAllowed(join(root, "link", "new", "x.jpg"), [root]), false, "below a link, though nothing there exists yet");
+  assert.equal(isUploadPathAllowed(join(root, "a.jpg"), [root]), true);
+
+  // the root is a link to a folder: what is inside the folder is allowed, by either name
+  const viaLink = join(base, "rootlink");
+  assert.equal(isUploadPathAllowed(join(root, "a.jpg"), [viaLink]), true);
+  assert.equal(isUploadPathAllowed(join(viaLink, "a.jpg"), [viaLink]), true);
+  assert.equal(isUploadPathAllowed(join(viaLink, "new.jpg"), [viaLink]), true);
+  assert.equal(isUploadPathAllowed(join(outside, "secret.txt"), [viaLink]), false);
+  assert.equal(isUploadPathAllowed(join(evil, "x"), [viaLink]), false);
+
+  // a link from elsewhere into the root
+  assert.equal(isUploadPathAllowed(join(base, "shortcut", "b.jpg"), [root]), true);
+  assert.equal(isUploadPathAllowed(join(base, "shortcut", "b.jpg"), [join(root, "sub")]), true);
+});
+
+test("link/.. leads nowhere: the path is refused, though lexically it stays in the folder", (t) => {
+  const { base, root } = policyTree();
+  const deep = join(base, "other", "deep");
+  mkdirSync(deep, { recursive: true });
+  writeFileSync(join(base, "other", "secret.xlsx"), "s");
+  writeFileSync(join(root, "secret.xlsx"), "r");
+  if (!linkDir(deep, join(root, "link"))) return t.skip("the OS refused to create a link (EPERM)");
+  const trick = `${root}${sep}link${sep}..${sep}secret.xlsx`;
+  assert.equal(isUploadPathAllowed(trick, [root]), false);
+  // a POSIX kernel follows the link and goes up from its target: this is what the refusal guards against
+  if (process.platform !== "win32") assert.equal(realpathSync.native(trick), join(base, "other", "secret.xlsx"));
+  assert.equal(isUploadPathAllowed(join(root, "secret.xlsx"), [root]), true, "the folder's own file, without the trick");
+  assert.equal(isUploadPathAllowed(join(base, "other", "secret.xlsx"), [root]), false);
+});
+
+test("on Windows the comparison ignores case, accepts both slashes, and refuses another drive", (t) => {
+  if (process.platform !== "win32") return t.skip("Windows only");
+  const { root, outside } = policyTree();
+  const slashes = (p) => p.split("\\").join("/");
+  assert.equal(isUploadPathAllowed(join(root, "a.jpg").toUpperCase(), [root]), true, "an existing file, other case");
+  assert.equal(isUploadPathAllowed(join(root, "not-there.jpg").toUpperCase(), [root]), true, "a file that does not exist, other case");
+  assert.equal(isUploadPathAllowed(join(root, "a.jpg"), [root.toLowerCase()]), true, "the root in other case");
+  assert.equal(isUploadPathAllowed(slashes(join(root, "a.jpg")), [slashes(root)]), true);
+  assert.equal(isUploadPathAllowed(slashes(join(root, "a.jpg")), [root]), true);
+  assert.equal(isUploadPathAllowed(join(root, "a.jpg"), [slashes(root)]), true);
+  assert.equal(isUploadPathAllowed(join(outside, "secret.txt").toUpperCase(), [root]), false);
+  assert.equal(isUploadPathAllowed(`${root.toUpperCase()}-EVIL\\x`, [root]), false);
+  const other = root[0].toUpperCase() === "Z" ? "Y" : "Z";
+  assert.equal(isUploadPathAllowed(`${other}:${root.slice(2)}\\a.jpg`, [root]), false, "the same folder on another drive");
+});
+
+const ABSOLUTE_ROOT = resolve(tmpdir(), "photos");
+function loadRoots(mediaUploadRoots, extra = {}) {
+  return stateWith({ baseUrl: "http://127.0.0.1:5001", apiKey: "hs_k", ...(mediaUploadRoots === undefined ? {} : { mediaUploadRoots }), ...extra })
+    .then((dir) => loadHeliconConfig(dir, {}));
+}
+
+test("mediaUploadRoots: none by default, entries trimmed, ${VAR} substituted, the folder need not exist", async () => {
+  assert.deepEqual((await loadRoots(undefined)).cfg.mediaUploadRoots, []);
+  assert.deepEqual((await loadRoots([])).cfg.mediaUploadRoots, []);
+
+  const two = resolve(tmpdir(), "not-created-yet", "clips");
+  const parsed = await loadRoots([`  ${ABSOLUTE_ROOT}  `, two]);
+  assert.equal(parsed.status, "enabled");
+  assert.deepEqual(parsed.cfg.mediaUploadRoots, [ABSOLUTE_ROOT, two]);
+
+  process.env.HELICON_TEST_MEDIA_ROOT = ABSOLUTE_ROOT;
+  try {
+    const viaEnv = await loadRoots(["${HELICON_TEST_MEDIA_ROOT}", "${HELICON_TEST_MEDIA_ROOT}/sub"]);
+    assert.deepEqual(viaEnv.cfg.mediaUploadRoots, [ABSOLUTE_ROOT, `${ABSOLUTE_ROOT}/sub`]);
+  } finally { delete process.env.HELICON_TEST_MEDIA_ROOT; }
+
+  const trip = `${ABSOLUTE_ROOT}/trip/..`;
+  assert.deepEqual((await loadRoots([trip])).cfg.mediaUploadRoots, [trip], "kept as written; the check resolves it");
+
+  const fifty = Array.from({ length: 50 }, (_, i) => resolve(tmpdir(), `r${i}`));
+  assert.equal((await loadRoots(fifty)).cfg.mediaUploadRoots.length, 50);
+});
+
+test("mediaUploadRoots: what is refused", async () => {
+  const refused = async (value, reason) => {
+    const out = await loadRoots(value);
+    assert.equal(out.status, "invalid", JSON.stringify(value));
+    assert.equal(out.reason, reason, JSON.stringify(value));
+  };
+  for (const value of [ABSOLUTE_ROOT, 5, true, null, { 0: ABSOLUTE_ROOT }]) {
+    await refused(value, "mediaUploadRoots must be an array of absolute folder paths");
+  }
+  await refused([5], "mediaUploadRoots.0 must be a non-empty string");
+  await refused([null], "mediaUploadRoots.0 must be a non-empty string");
+  await refused([ABSOLUTE_ROOT, ""], "mediaUploadRoots.1 must be a non-empty string");
+  await refused(["   "], "mediaUploadRoots.0 must be a non-empty string");
+  await refused([["nested"]], "mediaUploadRoots.0 must be a non-empty string");
+  await refused(["photos"], "mediaUploadRoots.0 must be an absolute path");
+  await refused([ABSOLUTE_ROOT, "./photos"], "mediaUploadRoots.1 must be an absolute path");
+  await refused(["~/photos"], "mediaUploadRoots.0 must be an absolute path");
+  await refused(["../photos"], "mediaUploadRoots.0 must be an absolute path");
+
+  // a variable that is set but gives no absolute path; one that is not set at all
+  process.env.HELICON_TEST_MEDIA_REL = "photos";
+  process.env.HELICON_TEST_MEDIA_EMPTY = "";
+  try {
+    await refused(["${HELICON_TEST_MEDIA_REL}"], "mediaUploadRoots.0 must be an absolute path");
+    await refused(["${HELICON_TEST_MEDIA_EMPTY}"], "mediaUploadRoots.0 must be an absolute path");
+  } finally { delete process.env.HELICON_TEST_MEDIA_REL; delete process.env.HELICON_TEST_MEDIA_EMPTY; }
+  delete process.env.HELICON_TEST_MEDIA_UNSET;
+  await refused([ABSOLUTE_ROOT, "${HELICON_TEST_MEDIA_UNSET}"], "Environment variable HELICON_TEST_MEDIA_UNSET is not set");
+
+  await refused(Array.from({ length: 51 }, (_, i) => resolve(tmpdir(), `r${i}`)), "mediaUploadRoots must include at most 50 entries");
+});
+
+const UPLOAD_OFF = "media_upload: uploading files is not enabled in this deployment (it has no folder allowed for it). Tell the user the files cannot be added.";
+const outsideText = (n, m, first) =>
+  `media_upload: nothing was added: ${n} of ${m} path(s) are outside the folders this deployment allows for upload (for example ${first}). ` +
+  "Ask the user for files inside an allowed folder; do not try other paths.";
+const uploadCalls = (t) => t.hs.calls.filter((c) => c.path === "/v1/document/upload");
+const mediaServerCalls = (t) => t.hs.calls.filter((c) => c.path.startsWith("/v1/document/") || c.path.startsWith("/v1/kb/"));
+
+test("media_upload names no folder it may add from by default: every named path is refused, and HeliconSearch is not asked", async () => {
+  const t = await attach();
+  try {
+    const upload = t.harness.registered[0].tools.media_upload;
+    for (const names of [["/photos/a.jpg"], [tmpdir()], ["/photos/a.jpg", "/photos/b.jpg"], ["/photos/a.jpg", "  "]]) {
+      assert.equal(await upload.execute({ file_names: names }, toolCtx()), UPLOAD_OFF);
+    }
+    assert.deepEqual(mediaServerCalls(t), [], "no upload, and not even the default library was looked up");
+    // blank names are no names: the attached-images flow answers, as before
+    assert.match(await upload.execute({ file_names: ["", "  "] }, toolCtx("s_blank")), /attached no images/);
+  } finally { await t.done(); }
+});
+
+test("media_upload passes the paths inside an allowed folder to HeliconSearch exactly as they were given", async () => {
+  const photos = mkdtempSync(join(tmpdir(), "ow-helicon-photos-"));
+  const nested = join(photos, "2024");
+  mkdirSync(nested);
+  const t = await attach({}, { mediaUploadRoots: [photos] });
+  try {
+    const names = [join(photos, "a.jpg"), `${nested}${sep}`, `${photos.split(sep).join("/")}/new/not-there-yet.png`, `${photos}${sep}.${sep}b.jpg`, `${photos}${sep}${sep}2024${sep}c.png`];
+    const out = await t.harness.registered[0].tools.media_upload.execute({ file_names: names }, toolCtx());
+    assert.equal(out.library, "kb1");
+    assert.deepEqual(uploadCalls(t).map((c) => c.body), [{ kb_id: "kb1", file_names: names }], "not the resolved paths");
+    assert.ok(t.hs.calls.some((c) => c.path === "/v1/kb/resolve_default"));
+  } finally { await t.done(); }
+});
+
+test("media_upload adds nothing when any path is outside the allowed folders, and says how many", async () => {
+  const photos = mkdtempSync(join(tmpdir(), "ow-helicon-photos-"));
+  const inside = join(photos, "a.jpg");
+  const t = await attach({}, { mediaUploadRoots: [photos] });
+  try {
+    const upload = t.harness.registered[0].tools.media_upload;
+    const secret = resolve(tmpdir(), "payroll", "salaries.xlsx");
+    assert.equal(await upload.execute({ file_names: [inside, secret] }, toolCtx()), outsideText(1, 2, secret));
+    assert.equal(await upload.execute({ file_names: [secret] }, toolCtx()), outsideText(1, 1, secret));
+    const evil = `${photos}-evil${sep}x.jpg`;
+    const dotdot = `${photos}${sep}..${sep}x.jpg`;
+    assert.equal(await upload.execute({ file_names: [evil, inside, dotdot] }, toolCtx()), outsideText(2, 3, evil), "the first one refused is quoted");
+    assert.equal(await upload.execute({ file_names: ["relative/a.jpg"] }, toolCtx()), outsideText(1, 1, "relative/a.jpg"));
+    const dotInside = `${photos}${sep}2024${sep}..${sep}a.jpg`;
+    assert.equal(await upload.execute({ file_names: [dotInside] }, toolCtx()), outsideText(1, 1, dotInside), "a .. segment is refused, though the path stays inside");
+    assert.deepEqual(mediaServerCalls(t), [], "nothing was uploaded, not even the allowed one, and no library was looked up");
+
+    const long = resolve(tmpdir(), "z".repeat(300));
+    const text = await upload.execute({ file_names: [long] }, toolCtx());
+    assert.equal(text, outsideText(1, 1, long.slice(0, 200)));
+    assert.equal(text.includes(long.slice(0, 201)), false);
+    assert.equal(text.includes(photos), false, "the allowed folders are not listed");
+
+    const log = readFileSync(join(t.dir, "helicon-memory", "adapter.log"), "utf8");
+    assert.match(log, /WARN \[helicon-memory\] tool=media_upload refused 1 of 2 path\(s\); first: /);
+    assert.match(log, /refused 2 of 3 path\(s\)/);
+  } finally { await t.done(); }
+});
+
+test("the images the user attached are added whatever mediaUploadRoots holds", async () => {
+  for (const extra of [{}, { mediaUploadRoots: [mkdtempSync(join(tmpdir(), "ow-helicon-elsewhere-"))] }]) {
+    const t = await attach({}, extra);
+    try {
+      await t.adapter.prepareTurn({ sessionId: "s_att", text: "here is my cat", submissionId: "u1", images: [{ name: "cat.png", mediaType: "image/png", bytes: PNG_1X1 }] });
+      const out = await t.harness.registered[0].tools.media_upload.execute({}, toolCtx("s_att"));
+      assert.equal(out.library, "kb1");
+      assert.equal(uploadCalls(t).length, 1);
+      assert.match(uploadCalls(t)[0].body.file_names[0], /helicon-memory\/uploads\/[0-9a-f]{16}\.png$/);
+    } finally { await t.done(); }
+  }
+});
+
+test("media_upload's name, description, parameters and guidance do not mention the folders (agents keep their definition)", async () => {
+  const t = await attach({}, { mediaUploadRoots: [resolve(tmpdir(), "photos")] });
+  try {
+    const tool = t.harness.registered[0].tools.media_upload;
+    assert.equal(
+      tool.description,
+      "Add image or video files to the media library so they can be found later with media_search. Give file_names as absolute " +
+      "paths of FILES on the machine HeliconSearch runs on. Add a whole directory only when the user explicitly names that directory; " +
+      "never guess a directory to add when a file path does not work \u2014 tell the user instead. With no file_names, the images the user " +
+      "attached in this conversation are added. Indexing takes a little while; the files are searchable once it finishes.",
+    );
+    assert.equal(
+      JSON.stringify(tool.inputSchema),
+      '{"type":"object","additionalProperties":false,"properties":{"file_names":{"type":"array","items":{"type":"string"},"description":' +
+      '"Absolute file paths (a directory only if the user named it). Omit to add the user\'s attached images."},"kb_id":{"type":"string",' +
+      '"description":"Target library id. Omit to use the default library."}}}',
+    );
+    const { instructions } = t.adapter.decorateAgent({ instructions: "Hi.", tools: [] });
+    assert.ok(instructions.includes(
+      "- helicon__media_upload(file_names?, kb_id?): add image or video files to the library so they can be found later (use it when the user asks to add, save or index them). " +
+      "file_names are absolute file paths on the machine HeliconSearch runs on; if a path is refused, say so instead of trying other paths or adding a directory. When the user attached images to the conversation, call it without file_names to add those; " +
+      "never ask the user for a path for an attached image.",
+    ));
+    assert.doesNotMatch(instructions + tool.description + JSON.stringify(tool.inputSchema), /mediaUploadRoots/);
   } finally { await t.done(); }
 });
 

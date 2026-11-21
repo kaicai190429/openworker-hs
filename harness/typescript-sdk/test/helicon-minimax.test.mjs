@@ -109,9 +109,10 @@ test("a real model: what the user said is remembered, recalled in a new session,
 
 test("a real model: it adds an image to the media library and finds it again from a description", async (t) => {
   if (skip(t)) return;
-  const x = await setup({ mediaAdminTools: true });
+  // media_upload adds a named path only from a folder the configuration allows
+  const dir = (await mkdtemp(join(tmpdir(), "ow-helicon-mm-img-"))).split("\\").join("/");
+  const x = await setup({ mediaAdminTools: true, mediaUploadRoots: [dir] });
   try {
-    const dir = (await mkdtemp(join(tmpdir(), "ow-helicon-mm-img-"))).split("\\").join("/");
     const red = `${dir}/red-${randomUUID().slice(0, 6)}.png`;
     const blue = `${dir}/blue-${randomUUID().slice(0, 6)}.png`;
     await writeFile(red, colourPng([230, 25, 25]));
