@@ -11,8 +11,10 @@ libraries.
 
 With it on:
 
-- **Recall.** Before each message is sent, memories relevant to it are retrieved and added to that turn's
-  `instruction_addendum`. The addendum is not part of the saved conversation, so recalled text is never stored again.
+- **Recall.** Before each message is sent, memories relevant to it are retrieved and put in front of the user's message,
+  in the message itself (`recallPlacement`, see the options below). The archive and capture cut them out again, so
+  recalled text is never stored again on HeliconSearch. With `recallPlacement: "system"` they are added to that turn's
+  `instruction_addendum` instead, which is not part of the saved conversation.
 - **A new session's first turn** also gets a short cross-session summary (recent sessions, pinned facts, project
   workflows). It is shown once, on that first turn, and not repeated.
 - **Capture.** After each completed turn, the new conversation is archived on HeliconSearch (as it was said, each turn
@@ -137,6 +139,7 @@ harness.shutdown().await?;   // always: it sends what is still pending and stops
 | `apiKey` | required | Tenant token: the token itself, or `"${HELICON_TENANT_TOKEN}"`. |
 | `agentId` / `projectId` | `openworker` / `""` | Where memories are written and read (strings: anything else is refused). |
 | `autoRecall` | `true` | Recall into every turn. |
+| `recallPlacement` | `user` | Where the recalled text (and a new session's cross-session summary) goes. `user`: in front of the user's message, in the message itself, followed by a blank line. The engine then keeps what the model was shown, so each turn's prompt starts with the previous one's: a model server that caches prompt prefixes can reuse the history instead of re-reading it after every new recall (how much of it is reused depends on the server). The cost: the recalled text stays in the history, so the context grows by one recall per turn, the model reads it as part of the user's message (it is still inside the `<relevant-memories>` envelope that tells it to treat it as data), and an application that matches on the exact text of a message the engine holds sees the recall in front of it. `system`: the turn's `instruction_addendum`, which is not part of the conversation and is replaced every turn (the behaviour before this option existed). The archive and capture cut the envelope out of a message, so HeliconSearch is not shown its own recall either way. Not an agent setting: changing it needs no new agent id. |
 | `autoCapture` | `true` | Archive and extract after every turn. Off: no new turn is archived or extracted, whoever asks (close and shutdown too). |
 | `captureMode` | `operator` | `operator`: HeliconSearch's model extracts, merges and updates facts from the whole conversation. `direct`: no model; user sentences that match a few keyword rules (and `customTriggers`) are stored as they are (at most 3 per capture cycle, normally one turn), and HeliconSearch still extracts the archived conversation when the session ends, so facts can be stored twice. |
 | `customTriggers` | none | Extra words that make `direct` mode store a sentence. |

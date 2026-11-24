@@ -58,6 +58,18 @@ pub(crate) enum CaptureMode {
     Operator,
 }
 
+/// Where the recalled memories go in the turn sent to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecallPlacement {
+    /// The turn's `instruction_addendum`: application text next to the system instructions, not part of the
+    /// conversation.
+    System,
+    /// In front of the user's message, in the message itself (the default): the conversation then keeps what the
+    /// model was shown, so the next turn's prompt starts with this turn's, as a model server's prefix cache needs.
+    /// The archive and capture strip the envelope again.
+    User,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct MemoryConfig {
     pub base_url: String,
@@ -88,6 +100,7 @@ pub(crate) struct MemoryConfig {
     /// The folders `media_upload` may add files from, as absolute paths. Empty (the default): it adds nothing.
     pub media_upload_roots: Vec<String>,
     pub capture_mode: CaptureMode,
+    pub recall_placement: RecallPlacement,
     pub capture_max_chars: usize,
     pub store_gate: bool,
     pub recall_gate: bool,
@@ -133,6 +146,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "autoCapture",
     "memoryStoreTool",
     "captureMode",
+    "recallPlacement",
     "captureMaxChars",
     "storeGate",
     "recallGate",
@@ -363,6 +377,15 @@ fn capture_mode(raw: Option<&Value>) -> Result<CaptureMode, String> {
     }
 }
 
+fn recall_placement(raw: Option<&Value>) -> Result<RecallPlacement, String> {
+    match raw.map(|v| v.as_str()) {
+        None => Ok(RecallPlacement::User),
+        Some(Some("system")) => Ok(RecallPlacement::System),
+        Some(Some("user")) => Ok(RecallPlacement::User),
+        Some(_) => Err("recallPlacement must be one of: system, user".into()),
+    }
+}
+
 impl MemoryConfig {
     /// Validates the options of a configuration file (without its `enabled` flag).
     pub(crate) fn parse(value: &Value, env: Env) -> Result<Self, String> {
@@ -431,6 +454,7 @@ impl MemoryConfig {
             media_inline_images: boolean(get("mediaInlineImages"), false)?,
             media_upload_roots: upload_roots(get("mediaUploadRoots"), env)?,
             capture_mode: capture_mode(get("captureMode"))?,
+            recall_placement: recall_placement(get("recallPlacement"))?,
             capture_max_chars: int(
                 "captureMaxChars",
                 100,
@@ -502,9 +526,24 @@ mod tests {
         );
         assert_eq!(cfg.agent_id, "openworker");
         assert_eq!(cfg.capture_mode, CaptureMode::Operator);
+        assert_eq!(cfg.recall_placement, RecallPlacement::User);
         assert!(cfg.replace_builtin_memory && cfg.auto_recall && cfg.auto_capture);
         assert_eq!(cfg.idle_end_ms, 1_800_000);
         assert_eq!(cfg.hook_timeout_ms, 15_000);
+    }
+
+    #[test]
+    fn recall_placement_is_the_user_message_unless_the_instructions_are_asked_for() {
+        let place = |v: Value| MemoryConfig::parse(&v, &env).unwrap().recall_placement;
+        assert_eq!(place(json!({"baseUrl":"http://h"})), RecallPlacement::User);
+        assert_eq!(
+            place(json!({"baseUrl":"http://h","recallPlacement":"system"})),
+            RecallPlacement::System
+        );
+        assert_eq!(
+            place(json!({"baseUrl":"http://h","recallPlacement":"user"})),
+            RecallPlacement::User
+        );
     }
 
     #[test]
@@ -527,6 +566,12 @@ mod tests {
             bad(json!({"baseUrl":"http://h","topK":0})).contains("topK must be between 1 and 50")
         );
         assert!(bad(json!({"baseUrl":"http://h","captureMode":"x"})).contains("captureMode"));
+        assert!(
+            bad(json!({"baseUrl":"http://h","recallPlacement":"x"})).contains("recallPlacement")
+        );
+        assert!(
+            bad(json!({"baseUrl":"http://h","recallPlacement":true})).contains("recallPlacement")
+        );
         assert!(bad(json!({"baseUrl":"http://h","autoRecall":"yes"})).contains("expected boolean"));
         // an id that is not a string would silently be another partition
         assert!(

@@ -119,7 +119,11 @@ async fn the_servers_recall_budgets_are_read_from_its_health() {
 async fn a_turn_is_recalled_into_from_the_real_organized_answer_and_the_real_bridge() {
     let hs = recorded_server().await;
     let dir = tempfile::tempdir().unwrap();
-    let inner = Inner::new(config(&hs, json!({})), dir.path());
+    // the recall as the addendum: that is where the test reads it
+    let inner = Inner::new(
+        config(&hs, json!({"recallPlacement": "system"})),
+        dir.path(),
+    );
     let session = SessionInfo {
         session_id: "real-1".into(),
         agent: "lead".into(),

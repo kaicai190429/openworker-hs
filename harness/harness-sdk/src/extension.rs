@@ -60,6 +60,18 @@ pub struct TurnContext<'a> {
     pub addendum: Option<&'a str>,
 }
 
+/// What the extensions add to a turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnAddition {
+    /// The addendum to send with the turn (`None`: none).
+    pub addendum: Option<String>,
+    /// Text put in front of the user's message, inside the message itself. Unlike the addendum it is part
+    /// of the conversation the engine keeps, so the next turn's prompt starts with this turn's; whatever
+    /// reads the conversation back (an archive, a capture) has to take it out again. The prefixes of
+    /// several extensions follow one another.
+    pub user_prefix: Option<String>,
+}
+
 pub trait Extension: Send + Sync + 'static {
     fn name(&self) -> &str;
 
@@ -83,6 +95,19 @@ pub trait Extension: Send + Sync + 'static {
     /// addendum stays as it was before this extension).
     fn before_send<'a>(&'a self, turn: TurnContext<'a>) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move { turn.addendum.map(str::to_owned) })
+    }
+
+    /// Like [`Extension::before_send`], and the one to implement to also put text in front of the user's message
+    /// (`TurnAddition::user_prefix`). Same rules: stable for a retry of the same submission; an addendum the
+    /// engine would refuse (over 32,000 bytes, a NUL) or a prefix over that size or with a NUL is ignored. The
+    /// default only calls `before_send`.
+    fn before_send_turn<'a>(&'a self, turn: TurnContext<'a>) -> BoxFuture<'a, TurnAddition> {
+        Box::pin(async move {
+            TurnAddition {
+                addendum: self.before_send(turn).await,
+                user_prefix: None,
+            }
+        })
     }
 
     /// `Session::close` is about to close the session.
@@ -134,15 +159,17 @@ impl Extensions {
             ignored(ext.as_ref(), "on_session_attached", done.is_err());
         }
     }
-    /// The addendum for a turn after every extension has had its say, in the order they were added.
-    pub(crate) async fn before_send(
+    /// What a turn gets after every extension has had its say, in the order they were added: the addendum (the last
+    /// answer that is allowed) and the text in front of the user's message (every allowed one, in order).
+    pub(crate) async fn turn(
         &self,
         session: &SessionInfo,
         submission_id: &str,
         text: &str,
         addendum: Option<String>,
-    ) -> Option<String> {
+    ) -> TurnAddition {
         let mut current = addendum;
+        let mut prefix = String::new();
         for ext in self.0.iter() {
             let turn = TurnContext {
                 session,
@@ -150,27 +177,45 @@ impl Extensions {
                 text,
                 addendum: current.as_deref(),
             };
-            // a panicking extension leaves the addendum as the one before it made it (the call sits inside the
-            // future, so a panic while the hook builds its future is caught as well)
-            match AssertUnwindSafe(async { ext.before_send(turn).await })
+            // a panicking extension leaves the turn as it was before it (the call sits inside the future, so a
+            // panic while the hook builds its future is caught as well)
+            match AssertUnwindSafe(async { ext.before_send_turn(turn).await })
                 .catch_unwind()
                 .await
             {
                 Ok(next) => {
-                    if next
-                        .as_deref()
-                        .is_some_and(|t| t.len() > MAX_ADDENDUM_BYTES || t.contains('\0'))
+                    let unusable = |t: &str| t.len() > MAX_ADDENDUM_BYTES || t.contains('\0');
+                    if next.addendum.as_deref().is_some_and(unusable)
+                        || next.user_prefix.as_deref().is_some_and(unusable)
                     {
                         // the engine would refuse every send of this application for it
                         refused(ext.as_ref());
                     } else {
-                        current = next;
+                        current = next.addendum;
+                        if let Some(p) = next.user_prefix {
+                            prefix.push_str(&p);
+                        }
                     }
                 }
                 Err(_) => ignored(ext.as_ref(), "before_send", true),
             }
         }
-        current
+        TurnAddition {
+            addendum: current,
+            user_prefix: (!prefix.is_empty()).then_some(prefix),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) async fn before_send(
+        &self,
+        session: &SessionInfo,
+        submission_id: &str,
+        text: &str,
+        addendum: Option<String>,
+    ) -> Option<String> {
+        self.turn(session, submission_id, text, addendum)
+            .await
+            .addendum
     }
     pub(crate) async fn before_close(&self, session: &SessionInfo) {
         for ext in self.0.iter() {
@@ -256,11 +301,70 @@ mod tests {
         }
     }
 
+    /// Puts text in front of the user's message and leaves the addendum as it found it.
+    struct Prefixes(&'static str);
+    impl Extension for Prefixes {
+        fn name(&self) -> &str {
+            "prefixes"
+        }
+        fn before_send_turn<'a>(&'a self, turn: TurnContext<'a>) -> BoxFuture<'a, TurnAddition> {
+            Box::pin(async move {
+                TurnAddition {
+                    addendum: turn.addendum.map(str::to_owned),
+                    user_prefix: Some(self.0.to_owned()),
+                }
+            })
+        }
+    }
+
     fn session() -> SessionInfo {
         SessionInfo {
             session_id: "s".into(),
             agent: "a".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn the_prefixes_of_the_extensions_follow_one_another_and_the_addendum_is_not_touched() {
+        let set = Extensions::new(vec![
+            Arc::new(Prefixes("one\n\n")),
+            Arc::new(Adds("a")),
+            Arc::new(Prefixes("two\n\n")),
+        ]);
+        let got = set.turn(&session(), "sub", "hi", Some("own".into())).await;
+        assert_eq!(got.user_prefix.as_deref(), Some("one\n\ntwo\n\n"));
+        assert_eq!(got.addendum.as_deref(), Some("own+a"));
+    }
+
+    #[tokio::test]
+    async fn an_extension_that_only_has_before_send_adds_no_prefix() {
+        let set = Extensions::new(vec![Arc::new(Adds("a"))]);
+        let got = set.turn(&session(), "sub", "hi", None).await;
+        assert_eq!(
+            got,
+            TurnAddition {
+                addendum: Some("a".into()),
+                user_prefix: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefix_the_engine_would_refuse_is_ignored_with_its_addendum() {
+        for bad in ["a\0b".to_owned(), "x".repeat(MAX_ADDENDUM_BYTES + 1)] {
+            let bad: &'static str = Box::leak(bad.into_boxed_str());
+            let set = Extensions::new(vec![Arc::new(Prefixes("ok\n\n")), Arc::new(Prefixes(bad))]);
+            let got = set.turn(&session(), "sub", "hi", Some("own".into())).await;
+            assert_eq!(got.user_prefix.as_deref(), Some("ok\n\n"));
+            assert_eq!(got.addendum.as_deref(), Some("own"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_extension_leaves_the_prefix_as_it_was() {
+        let set = Extensions::new(vec![Arc::new(Prefixes("one\n\n")), Arc::new(Panicky)]);
+        let got = set.turn(&session(), "sub", "hi", None).await;
+        assert_eq!(got.user_prefix.as_deref(), Some("one\n\n"));
     }
 
     #[tokio::test]

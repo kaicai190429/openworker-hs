@@ -7,7 +7,7 @@
 mod model_mock;
 use model_mock::{system_of, Answer, MockModel};
 use openworker_sdk::extension::{
-    BoxFuture, DecorateContext, Extension, SessionInfo, StartContext, TurnContext,
+    BoxFuture, DecorateContext, Extension, SessionInfo, StartContext, TurnAddition, TurnContext,
 };
 use openworker_sdk::{agents::*, Credentials, Error, Model, ModelProvider, Result, TurnOptions};
 use std::{
@@ -223,6 +223,78 @@ async fn hooks_fire_in_order_and_the_addendum_reaches_the_model_beside_the_calle
         "{system}"
     );
     assert!(!model_mock::conversation_of(request).contains("FROM-FIRST"));
+}
+
+/// Puts text in front of the user's message and nothing in the addendum.
+struct Prefixer;
+
+impl Extension for Prefixer {
+    fn name(&self) -> &str {
+        "prefixer"
+    }
+    fn before_send_turn<'a>(&'a self, turn: TurnContext<'a>) -> BoxFuture<'a, TurnAddition> {
+        Box::pin(async move {
+            TurnAddition {
+                addendum: turn.addendum.map(str::to_owned),
+                user_prefix: Some("NOTE-FOR-THE-MODEL\n\n".into()),
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_an_extension_puts_in_front_of_the_users_message_is_in_the_message_not_in_the_instructions(
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let model = model().await;
+    let h = builder(&root, &model)
+        .extension(Prefixer)
+        .agent(agent("early"))
+        .start()
+        .await
+        .unwrap();
+    let a = h.create_agent(agent("late")).await.unwrap();
+    let s = a.new_session().await.unwrap();
+    // both ways a message is sent: with options (session/send) and plainly (run/start)
+    let run = within(s.send_with_options(
+        "hello there",
+        TurnOptions {
+            instruction_addendum: Some("MINE".into()),
+            ..Default::default()
+        },
+    ))
+    .await
+    .unwrap();
+    within(run.result()).await.unwrap();
+    within(s.run("and again")).await.unwrap();
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+
+    let requests = model.requests();
+    let first = &requests[0];
+    let system = system_of(first);
+    assert!(
+        system.contains("Application instructions for this turn:\nMINE"),
+        "{system}"
+    );
+    assert!(!system.contains("NOTE-FOR-THE-MODEL"), "{system}");
+    // the conversation is read back as JSON text, in which a line break is the two characters \n
+    let conversation = model_mock::conversation_of(first);
+    assert!(
+        conversation.contains("NOTE-FOR-THE-MODEL\\n\\nhello there"),
+        "{conversation}"
+    );
+    // the second message, and the first one kept in the history as it was sent
+    let second = model_mock::conversation_of(requests.last().unwrap());
+    assert!(
+        second.contains("NOTE-FOR-THE-MODEL\\n\\nand again"),
+        "{second}"
+    );
+    assert!(
+        second.contains("NOTE-FOR-THE-MODEL\\n\\nhello there"),
+        "{second}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -9,7 +9,8 @@
 //!   tool call       `{type:"function_call", call_id, name, arguments}`
 //!   tool result     `{type:"function_call_output", call_id, output}`
 //! Reasoning items are never returned. The per-turn addendum (recalled memory) is not part of the
-//! history, so nothing injected needs stripping.
+//! history. With `recallPlacement: user` the recall is in front of the user's message and so is in the history: the
+//! archive and capture cut the `<relevant-memories>` envelope out of a message (`transcript.rs`, `strategy.rs`).
 use crate::HarnessClient;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};

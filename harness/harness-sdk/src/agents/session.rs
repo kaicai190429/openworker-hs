@@ -3,7 +3,7 @@
 //! busy retries and journal streaming all happen in the host, so this file is
 //! what every language SDK needs to reproduce, and no more.
 use super::team::Team;
-use crate::extension::{Extensions, SessionInfo};
+use crate::extension::{Extensions, SessionInfo, TurnAddition};
 use crate::{ApprovalDecision, Error, Event, HarnessClient, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -550,8 +550,14 @@ impl Session {
         if let Some(compaction) = options.compaction {
             parameters["compaction"] = json!(compaction);
         }
-        if let Some(addendum) = self.addendum(&id, text, options.instruction_addendum).await {
+        let addition = self
+            .turn_addition(&id, text, options.instruction_addendum)
+            .await;
+        if let Some(addendum) = addition.addendum {
             parameters["instruction_addendum"] = json!(addendum);
+        }
+        if let Some(prefix) = addition.user_prefix {
+            parameters["input"]["text"] = json!(format!("{prefix}{text}"));
         }
         if let Some(output) = options.output {
             parameters["output"] = json!(output);
@@ -626,8 +632,12 @@ impl Session {
         if let Some(limits) = limits {
             parameters["limits"] = json!(limits);
         }
-        if let Some(addendum) = self.addendum(id, text, None).await {
+        let addition = self.turn_addition(id, text, None).await;
+        if let Some(addendum) = addition.addendum {
             parameters["instruction_addendum"] = json!(addendum);
+        }
+        if let Some(prefix) = addition.user_prefix {
+            parameters["input"]["text"] = json!(format!("{prefix}{text}"));
         }
         let started = self.client.request("session/send", parameters).await?;
         Ok(Run {
@@ -733,21 +743,29 @@ impl Session {
         }
     }
 
-    /// The trusted addendum to send with a turn: the caller's own, as extended by the attached
-    /// extensions. Only when the host supports turn context; otherwise the caller's own.
-    async fn addendum(
+    /// What the attached extensions add to a turn: the trusted addendum (the caller's own, as extended; only when the
+    /// host supports turn context, otherwise the caller's own) and the text they put in front of the user's message
+    /// (plain text of the message, so it needs nothing of the host).
+    async fn turn_addition(
         &self,
         submission_id: &str,
         text: &str,
         own: Option<String>,
-    ) -> Option<String> {
-        if self.extensions.is_empty() || self.client.info()["capabilities"]["turn_context"] != true
-        {
-            return own;
+    ) -> TurnAddition {
+        if self.extensions.is_empty() {
+            return TurnAddition {
+                addendum: own,
+                user_prefix: None,
+            };
         }
-        self.extensions
-            .before_send(&self.info(), submission_id, text, own)
-            .await
+        let mut addition = self
+            .extensions
+            .turn(&self.info(), submission_id, text, own.clone())
+            .await;
+        if self.client.info()["capabilities"]["turn_context"] != true {
+            addition.addendum = own;
+        }
+        addition
     }
 
     pub fn id(&self) -> &str {
@@ -841,9 +859,17 @@ impl Session {
         let id = options
             .submission_id
             .unwrap_or_else(|| openworker_runtime::id("sub"));
-        let addendum = self
-            .addendum(&id, &text, options.instruction_addendum.clone())
+        let addition = self
+            .turn_addition(&id, &text, options.instruction_addendum.clone())
             .await;
+        let addendum = addition.addendum;
+        let mut parts = parts;
+        if let Some(prefix) = addition.user_prefix {
+            parts.insert(
+                0,
+                openworker_runtime::attachments::Part::Text { text: prefix },
+            );
+        }
         let value=self.client.request("session/send",json!({"session_id":self.id(),"submission_id":id,"input":{"content":parts},"limits":options.limits,"safety":options.safety,"instruction_addendum":addendum,"auto_approver_context":options.auto_approver_context,"compaction":options.compaction,"output":options.output})).await?;
         Ok(Run {
             session: self.clone(),
@@ -855,8 +881,16 @@ impl Session {
         let text = user_text(&input);
         let parts = input.upload(&self.client, self.id()).await?;
         let id = openworker_runtime::id("sub");
+        let addition = self.turn_addition(&id, &text, None).await;
+        let mut parts = parts;
+        if let Some(prefix) = addition.user_prefix {
+            parts.insert(
+                0,
+                openworker_runtime::attachments::Part::Text { text: prefix },
+            );
+        }
         let mut parameters = json!({"session_id":self.id(),"submission_id":id,"content":parts});
-        if let Some(addendum) = self.addendum(&id, &text, None).await {
+        if let Some(addendum) = addition.addendum {
             parameters["instruction_addendum"] = json!(addendum);
         }
         self.client.request("run/start", parameters).await?;
@@ -875,8 +909,16 @@ impl Session {
         let text = user_text(&input);
         let parts = input.upload(&self.client, self.id()).await?;
         let id = openworker_runtime::id("sub");
+        let addition = self.turn_addition(&id, &text, None).await;
+        let mut parts = parts;
+        if let Some(prefix) = addition.user_prefix {
+            parts.insert(
+                0,
+                openworker_runtime::attachments::Part::Text { text: prefix },
+            );
+        }
         let mut parameters = json!({"session_id":self.id(),"submission_id":id,"content":parts});
-        if let Some(addendum) = self.addendum(&id, &text, None).await {
+        if let Some(addendum) = addition.addendum {
             parameters["instruction_addendum"] = json!(addendum);
         }
         let started = self.client.request("run/start", parameters).await?;
@@ -901,9 +943,14 @@ impl Session {
     }
 
     async fn start(&self, submission_id: &str, input: &str) -> Result<Value> {
+        let addition = self.turn_addition(submission_id, input, None).await;
+        let text = match &addition.user_prefix {
+            Some(prefix) => format!("{prefix}{input}"),
+            None => input.to_owned(),
+        };
         let mut parameters =
-            json!({"session_id": self.id(), "submission_id": submission_id, "text": input});
-        if let Some(addendum) = self.addendum(submission_id, input, None).await {
+            json!({"session_id": self.id(), "submission_id": submission_id, "text": text});
+        if let Some(addendum) = addition.addendum {
             parameters["instruction_addendum"] = json!(addendum);
         }
         self.client.request("run/start", parameters).await

@@ -76,7 +76,7 @@ async fn a_conversation_is_recalled_archived_extracted_and_ended() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
-    configure(&root, &hs, json!({}));
+    configure(&root, &hs, json!({"recallPlacement": "system"}));
     let h = start(&root).await;
     let a = h.create_agent(agent()).await.unwrap();
     let s = a.new_session_in(workspace(&root)).await.unwrap();
@@ -259,7 +259,11 @@ async fn it_works_the_same_with_the_engine_in_a_child_process() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
-    configure(&root, &hs, json!({"sessionBridge": false}));
+    configure(
+        &root,
+        &hs,
+        json!({"sessionBridge": false, "recallPlacement": "system"}),
+    );
     let h = Harness::builder()
         .state_dir(root.join("state"))
         .executable(runner())
@@ -529,14 +533,18 @@ async fn an_option_that_changes_a_tools_text_does_not_switch_the_memory_off_at_t
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
-    configure(&root, &hs, json!({}));
+    configure(&root, &hs, json!({"recallPlacement": "system"}));
     let h = start(&root).await;
     h.create_agent(agent()).await.unwrap();
     within(h.shutdown()).await.unwrap();
 
     // topK and autoRecall are written into the descriptions of the memory tools, which the engine keeps
     // (a tool of the same name must not change)
-    configure(&root, &hs, json!({"topK": 7, "autoRecall": false}));
+    configure(
+        &root,
+        &hs,
+        json!({"topK": 7, "autoRecall": false, "recallPlacement": "system"}),
+    );
     let h = start(&root).await;
     let a = h
         .create_agent(

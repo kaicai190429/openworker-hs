@@ -100,7 +100,7 @@ async fn the_model_is_sent_the_recall_and_the_first_turn_summary_once_and_never_
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
-    configure(&root, &hs, json!({}));
+    configure(&root, &hs, json!({"recallPlacement": "system"}));
     let model = model().await;
     let h = start(&root, &model).await;
     let a = h.create_agent(agent()).await.unwrap();
@@ -170,6 +170,80 @@ async fn the_model_is_sent_the_recall_and_the_first_turn_summary_once_and_never_
     assert!(archived
         .iter()
         .any(|t| t["content"] == "Tea it is." && t["role"] == "assistant"));
+    within(s.close()).await.unwrap();
+    within(h.shutdown()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_recall_placement_user_the_recall_is_in_the_users_message_and_the_archive_has_only_what_was_said(
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let hs = hs().await;
+    configure(&root, &hs, json!({"recallPlacement": "user"}));
+    let model = model().await;
+    let h = start(&root, &model).await;
+    let a = h.create_agent(agent()).await.unwrap();
+    let s = a.new_session_in(workspace(&root)).await.unwrap();
+
+    within(s.run("What tea do I like?")).await.unwrap();
+    let first = &model.requests()[0];
+    let system = system_of(first);
+    // the usage rules stay in the instructions; the recalled text and the first-turn summary do not
+    assert!(system.contains("## Long-term Memory"), "{system}");
+    assert!(
+        !system.contains("Application instructions for this turn:")
+            && !system.contains("- likes tea")
+            && !system.contains("lives in Oslo"),
+        "{system}"
+    );
+    // they are in the user's message, in front of the words (a line break is the two characters \n here)
+    let said = conversation_of(first);
+    assert!(
+        said.contains("<relevant-memories>")
+            && said.contains("- likes tea")
+            && said.contains("lives in Oslo")
+            && said.contains("</relevant-memories>\\n\\nWhat tea do I like?"),
+        "{said}"
+    );
+
+    // the second turn: the history keeps the first message as the model saw it (so the prompt starts with the
+    // last one's), the new recall is in front of the new message, the first-turn summary is not repeated
+    within(s.run("And coffee?")).await.unwrap();
+    let said = conversation_of(&model.requests()[1]);
+    assert!(
+        said.contains("</relevant-memories>\\n\\nWhat tea do I like?"),
+        "{said}"
+    );
+    assert!(
+        said.contains("</relevant-memories>\\n\\nAnd coffee?"),
+        "{said}"
+    );
+    assert_eq!(said.matches("lives in Oslo").count(), 1, "{said}");
+
+    // HeliconSearch is asked with the user's words alone, and archives them without the recall
+    let queries = all(&hs, "/v1/memory/query");
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].body["query"], "What tea do I like?");
+    assert_eq!(queries[1].body["query"], "And coffee?");
+    let turns = seen(&hs, "/v1/memory/session/turn").await;
+    let archived: Vec<&Value> = turns.body["turns"].as_array().unwrap().iter().collect();
+    assert_eq!(archived[0]["content"], "What tea do I like?");
+    for turn in &archived {
+        let text = turn["content"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("relevant-memories") && !text.contains("likes tea"),
+            "{text}"
+        );
+    }
+    // and so does the extraction: what HeliconSearch is asked to extract from has no recall in it either
+    let add = seen(&hs, "/v1/memory/add").await;
+    let sent = add.body.to_string();
+    assert!(sent.contains("What tea do I like?"), "{sent}");
+    assert!(
+        !sent.contains("relevant-memories") && !sent.contains("likes tea"),
+        "{sent}"
+    );
     within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();
 }
@@ -342,11 +416,26 @@ fn tool_results(request: &Value) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn each_way_of_sending_a_message_carries_the_recall() {
+async fn each_way_of_sending_a_message_carries_the_recall_in_the_instructions() {
+    each_way_of_sending_a_message("system").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_way_of_sending_a_message_carries_the_recall_in_the_message_by_default() {
+    each_way_of_sending_a_message("user").await;
+}
+
+async fn each_way_of_sending_a_message(placement: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let hs = hs().await;
-    configure(&root, &hs, json!({"sessionBridge": false}));
+    // (for "user" the option is left out: it is the default)
+    let options = if placement == "user" {
+        json!({"sessionBridge": false})
+    } else {
+        json!({"sessionBridge": false, "recallPlacement": placement})
+    };
+    configure(&root, &hs, options);
     let model = model().await;
     let h = start(&root, &model).await;
     let a = h.create_agent(agent()).await.unwrap();
@@ -408,14 +497,30 @@ async fn each_way_of_sending_a_message_carries_the_recall() {
         "send_with_id",
     ]) {
         let system = system_of(request);
-        assert!(
-            system.contains("<relevant-memories>") && system.contains("- likes tea"),
-            "{how}: {system}"
-        );
-        assert!(
-            conversation_of(request).contains(&format!("via {how}")),
-            "{how}"
-        );
+        let said = conversation_of(request);
+        if placement == "user" {
+            // in front of the message (a line break is the two characters \n in the conversation's JSON text)
+            assert!(
+                !system.contains("- likes tea")
+                    && said.contains("- likes tea")
+                    && said.contains("</relevant-memories>\\n\\n")
+                    && said.contains(&format!("via {how}")),
+                "{how}: {said}"
+            );
+            if !how.contains("input") {
+                // a text message: the recall and the words are one text; an input with parts has the recall as its first part
+                assert!(
+                    said.contains(&format!("</relevant-memories>\\n\\nvia {how}")),
+                    "{how}: {said}"
+                );
+            }
+        } else {
+            assert!(
+                system.contains("<relevant-memories>") && system.contains("- likes tea"),
+                "{how}: {system}"
+            );
+            assert!(said.contains(&format!("via {how}")), "{how}");
+        }
     }
     // HeliconSearch was asked with each message's own words
     let queries: Vec<String> = all(&hs, "/v1/memory/query")
@@ -436,6 +541,17 @@ async fn each_way_of_sending_a_message_carries_the_recall() {
         ]
     );
     within(s.close()).await.unwrap();
+    // whatever way it was sent, the archive has what the user said and nothing of the recall
+    let archived: Vec<String> = all(&hs, "/v1/memory/session/turn")
+        .iter()
+        .flat_map(|r| r.body["turns"].as_array().cloned().unwrap_or_default())
+        .filter(|t| t["role"] == "user")
+        .map(|t| t["content"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        archived, queries,
+        "the archived user turns are the user's own words, in order"
+    );
     within(h.shutdown()).await.unwrap();
 }
 
@@ -636,7 +752,8 @@ async fn an_agent_given_to_the_builder_loses_the_builtin_memory_but_is_still_rec
     for name in BUILTIN_MEMORY_TOOLS {
         assert!(!tools.contains(&name.to_owned()), "{name} in {tools:?}");
     }
-    assert!(system_of(request).contains("<relevant-memories>"));
+    // (by default the recall is in front of the user's message)
+    assert!(conversation_of(request).contains("<relevant-memories>"));
     seen(&hs, "/v1/memory/session/turn").await;
     within(s.close()).await.unwrap();
     within(h.shutdown()).await.unwrap();

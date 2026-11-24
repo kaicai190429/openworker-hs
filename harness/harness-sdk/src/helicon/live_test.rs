@@ -55,7 +55,7 @@ async fn live_memory_round_trip() {
     let cfg = Arc::new(
         MemoryConfig::parse(
             &json!({"baseUrl": url, "apiKey": token, "agentId": agent, "projectId": "live",
-                "captureMode": "direct", "debug": true}),
+                "captureMode": "direct", "debug": true, "recallPlacement": "system"}),
             &|_| None,
         )
         .unwrap(),
@@ -337,7 +337,7 @@ async fn live_the_bridge_and_recall_of_an_agent_with_real_memories() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Arc::new(
         MemoryConfig::parse(
-            &json!({"baseUrl": url, "apiKey": token, "agentId": agent, "debug": true}),
+            &json!({"baseUrl": url, "apiKey": token, "agentId": agent, "debug": true, "recallPlacement": "system"}),
             &|_| None,
         )
         .unwrap(),
