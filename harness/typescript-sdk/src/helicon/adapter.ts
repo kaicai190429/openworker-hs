@@ -336,6 +336,7 @@ export class HeliconAdapter {
    * What to add to this turn's `instructionAddendum`: the memories recalled for the user's message,
    * and — on a new session's first turn only — the cross-session bridge. The caller's own addendum
    * is kept first. A retry of the same submission gets the same text. Never throws.
+   * (With `recallPlacement: "user"` the memories are not in the addendum: see `prepareTurnParts`.)
    */
   async prepareTurn(args: {
     sessionId: string;
@@ -345,8 +346,25 @@ export class HeliconAdapter {
     /** images the user attached to this message */
     images?: ImageAttachment[];
   }): Promise<string | undefined> {
+    return (await this.prepareTurnParts(args)).addendum;
+  }
+
+  /**
+   * The turn's addendum and the text for the front of the user's message. `recallPlacement: "user"` (the default): the
+   * addendum stays the caller's own and the memories go in front of the user's message, followed by a blank line.
+   * `"system"`: the recalled memories join the addendum, the caller's own first. Either way a retry of the same
+   * submission gets the same text. Never throws.
+   */
+  async prepareTurnParts(args: {
+    sessionId: string;
+    text: string;
+    submissionId: string;
+    userAddendum?: string | undefined;
+    images?: ImageAttachment[];
+  }): Promise<{ addendum: string | undefined; userPrefix: string | undefined }> {
     const { sessionId, text, submissionId, userAddendum } = args;
-    if (this.excluded.has(sessionId)) return userAddendum;
+    const plain = { addendum: userAddendum, userPrefix: undefined };
+    if (this.excluded.has(sessionId)) return plain;
     try {
       this.touch(sessionId);
       this.running.set(sessionId, Date.now());
@@ -365,15 +383,20 @@ export class HeliconAdapter {
       }
       // the engine refuses a NUL in the addendum
       ours = ours?.replaceAll("\0", "");
-      if (!ours?.trim()) return userAddendum;
+      if (!ours?.trim()) return plain;
+      if (this.cfg.recallPlacement === "user") {
+        // in front of the user's message; the turn's addendum stays what the caller gave
+        const fitted = fitEnvelopes(ours, MAX_ADDENDUM_BYTES);
+        return { addendum: userAddendum, userPrefix: fitted ? `${fitted}\n\n` : undefined };
+      }
       const own = userAddendum ?? "";
       const room = MAX_ADDENDUM_BYTES - utf8Length(own) - (own ? 2 : 0);
       const fitted = fitEnvelopes(ours, room);
-      if (!fitted) return userAddendum;
-      return own ? `${own}\n\n${fitted}` : fitted;
+      if (!fitted) return plain;
+      return { addendum: own ? `${own}\n\n${fitted}` : fitted, userPrefix: undefined };
     } catch (err) {
       this.logger.warn(`[${PLUGIN_ID}] recall skipped: ${formatHeliconError(err)}`);
-      return userAddendum;
+      return plain;
     }
   }
 

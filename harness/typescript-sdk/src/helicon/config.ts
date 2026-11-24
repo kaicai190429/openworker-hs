@@ -21,6 +21,14 @@ export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 
 export const CAPTURE_MODES = ["direct", "operator"] as const;
 export type CaptureMode = (typeof CAPTURE_MODES)[number];
+/**
+ * Where the recalled text goes in the turn sent to the model. `user` (the default): in front of the user's message, in the
+ * message itself, so the engine keeps what the model was shown and each turn's prompt starts with the previous one's (a
+ * model server's prefix cache needs that); the archive and capture cut the envelope out again. `system`: the turn's
+ * `instructionAddendum`, which is not part of the conversation.
+ */
+export const RECALL_PLACEMENTS = ["system", "user"] as const;
+export type RecallPlacement = (typeof RECALL_PLACEMENTS)[number];
 
 export const DEFAULT_BASE_URL = "http://127.0.0.1:5001";
 export const DEFAULT_AGENT_ID = "openworker";
@@ -118,6 +126,7 @@ export type MemoryConfig = {
   /** whether the agent gets the memory_store tool (writes of its own, beside what capture extracts) */
   memoryStoreTool: boolean;
   captureMode: CaptureMode;
+  recallPlacement: RecallPlacement;
   captureMaxChars: number;
   storeGate: boolean;
   recallGate: boolean;
@@ -175,6 +184,7 @@ const ALLOWED_KEYS = [
   "autoCapture",
   "memoryStoreTool",
   "captureMode",
+  "recallPlacement",
   "captureMaxChars",
   "storeGate",
   "recallGate",
@@ -371,6 +381,14 @@ function parseCustomTriggers(raw: unknown): string[] | undefined {
   return out;
 }
 
+function parseRecallPlacement(raw: unknown): RecallPlacement {
+  if (raw === undefined) return "user";
+  if (typeof raw !== "string" || !(RECALL_PLACEMENTS as readonly string[]).includes(raw)) {
+    throw new Error(`recallPlacement must be one of: ${RECALL_PLACEMENTS.join(", ")}`);
+  }
+  return raw as RecallPlacement;
+}
+
 function parseCaptureMode(raw: unknown): CaptureMode {
   if (raw === undefined) {
     return DEFAULT_CAPTURE_MODE;
@@ -446,6 +464,7 @@ export const memoryConfigSchema = {
     const memoryStoreTool = parseBoolean(cfg.memoryStoreTool, DEFAULT_MEMORY_STORE_TOOL);
     const debug = parseBoolean(cfg.debug, false);
     const captureMode = parseCaptureMode(cfg.captureMode);
+    const recallPlacement = parseRecallPlacement(cfg.recallPlacement);
     // 服务端的 StoreGate（heliconsearch services/memory/store_gate.py）默认关，由这里显式
     // 打开：抽取前判一次「这段里用户有没有引入值得长期记住的新信息」，没有就整段不抽。
     // 默认 true —— 闸门要挡的正是 agent 会话这一侧的噪声（ping / 心跳轮询 / 纯回忆提问），
@@ -557,6 +576,7 @@ export const memoryConfigSchema = {
       autoCapture,
       memoryStoreTool,
       captureMode,
+      recallPlacement,
       captureMaxChars,
       storeGate,
       recallGate,

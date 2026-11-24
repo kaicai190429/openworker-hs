@@ -14,7 +14,7 @@ import { isAbsolute } from "node:path";
 import { Transport } from "./transport.js";
 import { agentWire, resolveOptions } from "./config.js";
 import { HeliconAdapter } from "./helicon/adapter.js";
-import { adapterOf, imageAttachments, messageText, setAdapter } from "./helicon/registry.js";
+import { adapterOf, imageAttachments, inFrontOfTheMessage, messageText, setAdapter } from "./helicon/registry.js";
 import {sandboxWire} from "./team-placement.js";
 import {
   ToolImageResult,
@@ -861,7 +861,9 @@ export class Session {
         "Mixed or unknown session input fields",
       );
     const submissionId = options.submissionId ?? randomUUID();
-    const addendum = control ? options.instructionAddendum : await this.recalled(input, submissionId, options.instructionAddendum);
+    const { addendum, userPrefix } = control
+      ? { addendum: options.instructionAddendum, userPrefix: undefined }
+      : await this.recalled(input, submissionId, options.instructionAddendum);
     const wire = (value.type === "approval" || value.type === "answer")
       ? {
           ...value,
@@ -877,7 +879,7 @@ export class Session {
       await this.harness.request("session/send", {
         session_id: this.id,
         submission_id: submissionId,
-        input: wire,
+        input: userPrefix === undefined ? wire : inFrontOfTheMessage(wire as Record<string, unknown>, userPrefix),
         limits: options.limits,
         instruction_addendum: addendum,
         auto_approver_context: options.autoApproverContext,
@@ -995,15 +997,17 @@ export class Session {
       content=await stageInput(input,this.id,(m,p)=>this.harness.request(m,p),options.signal);
     }
     aborted(options.signal);
+    const recalled = await this.recalled(input, submissionId, options.instructionAddendum);
+    const message = inFrontOfTheMessage({ text: typeof input === "string" ? input : undefined, content }, recalled.userPrefix);
     try {
       return record(
         await this.harness.request("run/start", {
           session_id: this.id,
           submission_id: submissionId,
-          text: typeof input==="string"?input:undefined,
-          content,
+          text: message.text,
+          content: message.content,
           limits:options.limits,
-          instruction_addendum:await this.recalled(input, submissionId, options.instructionAddendum),
+          instruction_addendum: recalled.addendum,
           auto_approver_context:options.autoApproverContext,
           compaction: options.compaction === undefined ? undefined : { additional_instructions: options.compaction.additionalInstructions },
           output:options.output,
@@ -1054,11 +1058,14 @@ export class Session {
       }),
     );
   }
-  /** The turn's application addendum: the caller's own, plus recalled memory when the Helicon adapter is on. */
-  private async recalled(input: unknown, submissionId: string, addendum: string | undefined): Promise<string | undefined> {
+  /**
+   * What the turn is sent besides the user's text: the application addendum (the caller's own, plus recalled memory when the Helicon
+   * adapter is on) and the text for the front of the user's message (the recall, with `recallPlacement: "user"`).
+   */
+  private async recalled(input: unknown, submissionId: string, addendum: string | undefined): Promise<{ addendum: string | undefined; userPrefix: string | undefined }> {
     const memory = adapterOf(this.harness);
-    if (!memory) return addendum; // nothing about the input is looked at when memory is off
-    return memory.prepareTurn({ sessionId: this.id, text: messageText(input), submissionId, userAddendum: addendum, images: imageAttachments(input) });
+    if (!memory) return { addendum, userPrefix: undefined }; // nothing about the input is looked at when memory is off
+    return memory.prepareTurnParts({ sessionId: this.id, text: messageText(input), submissionId, userAddendum: addendum, images: imageAttachments(input) });
   }
   async close(): Promise<void> {
     const memory = adapterOf(this.harness);

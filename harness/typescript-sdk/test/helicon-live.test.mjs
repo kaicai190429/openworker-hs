@@ -26,7 +26,6 @@ test("a fact told in one session is recalled in the next, through the real engin
   try {
     await harness.setModelProvider({ name: "mockmodel", api: "anthropic", baseUrl: model.url, credentials: { apiKey: "sk-mock-key-0001", storage: "memory" } });
     const agent = harness.createAgent({ name: "helicon-live-v1", instructions: "You are a test agent.", defaultModel: { provider: "mockmodel", name: "claude-test" }, tools: [], planning: false, memory: false, scheduling: false, approvals: { mode: "never" } });
-    const systemOf = (req) => (typeof req.system === "string" ? req.system : JSON.stringify(req.system));
 
     const a = await agent.newSession();
     await a.run("My favourite colour is teal and I live in Chengdu.");
@@ -48,9 +47,10 @@ test("a fact told in one session is recalled in the next, through the real engin
     const b = await agent.newSession();
     const n = model.requests.length;
     await b.run("What is my favourite colour?");
-    const system = systemOf(model.requests[n]);
-    assert.match(system, /<relevant-memories>/);
-    assert.match(system, /teal/i);
+    // the recall is in front of the user's message (the default placement)
+    const sent = JSON.stringify(model.requests[n].messages.at(-1));
+    assert.match(sent, /<relevant-memories>/);
+    assert.match(sent, /teal/i);
 
     const m = model.requests.length;
     await b.run("CALL_TOOL:helicon__memory_recall");

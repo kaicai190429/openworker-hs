@@ -53,3 +53,14 @@ export function messageText(input: unknown): string {
   }
   return "";
 }
+
+/**
+ * The message as sent with `prefix` (the recalled memories, `recallPlacement: "user"`) in front of it: before its text, or as a
+ * text part ahead of its content parts. No prefix: the message as it is.
+ */
+export function inFrontOfTheMessage<T extends { text?: unknown; content?: unknown }>(message: T, prefix: string | undefined): T {
+  if (prefix === undefined) return message;
+  if (typeof message.text === "string") return { ...message, text: prefix + message.text };
+  if (Array.isArray(message.content)) return { ...message, content: [{ type: "text", text: prefix }, ...message.content] };
+  return message;
+}
