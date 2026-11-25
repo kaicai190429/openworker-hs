@@ -101,6 +101,10 @@ pub(crate) struct MemoryConfig {
     pub media_upload_roots: Vec<String>,
     pub capture_mode: CaptureMode,
     pub recall_placement: RecallPlacement,
+    /// With `recallPlacement: user`: a recalled item whose text the conversation already holds is pointed to, not
+    /// shown again (a recall of items it all holds is one line). What the conversation holds is forgotten when
+    /// the engine compacts it.
+    pub recall_reference: bool,
     pub capture_max_chars: usize,
     pub store_gate: bool,
     pub recall_gate: bool,
@@ -147,6 +151,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "memoryStoreTool",
     "captureMode",
     "recallPlacement",
+    "recallReference",
     "captureMaxChars",
     "storeGate",
     "recallGate",
@@ -427,6 +432,11 @@ impl MemoryConfig {
         } else {
             int("idleEndMs", 1_000, 86_400_000, 1_800_000)? as u64
         };
+        let recall_placement = recall_placement(get("recallPlacement"))?;
+        let recall_reference = boolean(get("recallReference"), false)?;
+        if recall_reference && recall_placement != RecallPlacement::User {
+            return Err("recallReference needs recallPlacement \"user\": it points to text the conversation holds, and a recall in the instructions is not part of the conversation".into());
+        }
         Ok(Self {
             base_url: normalize_base_url(base, env)?,
             agent_id,
@@ -454,7 +464,8 @@ impl MemoryConfig {
             media_inline_images: boolean(get("mediaInlineImages"), false)?,
             media_upload_roots: upload_roots(get("mediaUploadRoots"), env)?,
             capture_mode: capture_mode(get("captureMode"))?,
-            recall_placement: recall_placement(get("recallPlacement"))?,
+            recall_placement,
+            recall_reference,
             capture_max_chars: int(
                 "captureMaxChars",
                 100,
@@ -544,6 +555,44 @@ mod tests {
             place(json!({"baseUrl":"http://h","recallPlacement":"user"})),
             RecallPlacement::User
         );
+    }
+
+    #[test]
+    fn recall_reference_is_off_by_default_and_needs_the_recall_in_the_user_message() {
+        let parse = |v: Value| MemoryConfig::parse(&v, &env);
+        assert!(
+            !parse(json!({"baseUrl":"http://h"}))
+                .unwrap()
+                .recall_reference
+        );
+        assert!(
+            parse(json!({"baseUrl":"http://h","recallReference":true}))
+                .unwrap()
+                .recall_reference
+        );
+        assert!(
+            parse(json!({"baseUrl":"http://h","recallPlacement":"user","recallReference":true}))
+                .unwrap()
+                .recall_reference
+        );
+        let err =
+            parse(json!({"baseUrl":"http://h","recallPlacement":"system","recallReference":true}))
+                .unwrap_err();
+        assert!(
+            err.contains("recallReference needs recallPlacement"),
+            "{err}"
+        );
+        // off with the recall in the instructions is nothing to refuse
+        assert!(
+            !parse(
+                json!({"baseUrl":"http://h","recallPlacement":"system","recallReference":false})
+            )
+            .unwrap()
+            .recall_reference
+        );
+        assert!(parse(json!({"baseUrl":"http://h","recallReference":"yes"}))
+            .unwrap_err()
+            .contains("expected boolean"));
     }
 
     #[test]

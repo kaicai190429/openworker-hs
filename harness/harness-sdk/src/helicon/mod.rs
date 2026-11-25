@@ -60,7 +60,7 @@ use filters::wrap_relevant_memories_block;
 use futures_util::future::{BoxFuture as SharedBox, FutureExt, Shared};
 use guidance::{agent_guidance, MODEL_TOOL_PREFIX, TOOL_NAMESPACE};
 use log::Logger;
-use recall::{perform_auto_recall, RecallParams};
+use recall::{perform_auto_recall, RecallParams, SeenBlocks};
 use serde_json::json;
 use session_store::SessionStore;
 use std::{
@@ -86,6 +86,9 @@ const ORPHANS_PER_START: usize = 10;
 /// A turn in flight keeps its session from being called idle for this long at most (a turn whose end
 /// we never saw must not keep a session open for ever).
 const RUNNING_CAP_MS: u64 = 6 * 3_600_000;
+
+/// `recallReference`: most recall blocks a session's record may hold (one that grows past it starts again).
+const SEEN_BLOCKS_MAX: usize = 512;
 
 /// `text` (blocks that each end with `</relevant-memories>`) within `room` bytes. A cut keeps the last
 /// envelope closed, so what follows the addendum (the engine's own notes) is not read as part of it.
@@ -153,6 +156,10 @@ struct Inner {
     guidance: String,
     /// The recall made for a submission, so a retry of it gets the same text.
     recalled: Mutex<BoundedMap<String, Option<String>>>,
+    /// `recallReference`: per session, the recall blocks its conversation holds (identity, hash of the text shown) ...
+    shown: Mutex<HashMap<String, SeenBlocks>>,
+    /// ... and the blocks of the turn in flight, which join them when the turn completes.
+    pending_shown: Mutex<HashMap<String, Vec<(String, u64)>>>,
     /// Sessions that went through the SDK's `Session`, and have not been closed.
     attached: Mutex<HashSet<String>>,
     /// Sessions this process created, resumed or took a turn in, and has not closed: what shutdown and
@@ -207,6 +214,8 @@ impl Inner {
             store: Arc::new(Mutex::new(SessionStore::new(root, logger.clone()))),
             capture: OnceLock::new(),
             recalled: Mutex::new(BoundedMap::new(SUBMISSION_CACHE_MAX)),
+            shown: Mutex::default(),
+            pending_shown: Mutex::default(),
             attached: Mutex::default(),
             known: Mutex::default(),
             excluded: Mutex::default(),
@@ -371,6 +380,14 @@ impl Inner {
             async { BridgeTurn::Omitted("not the first turn".into()) }.boxed()
         };
         let frozen = freeze_bridge_by(bridge, budget.compose_by_ms());
+        let seen: Option<SeenBlocks> = cfg.recall_reference.then(|| {
+            self.shown
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .cloned()
+                .unwrap_or_default()
+        });
         let recall = perform_auto_recall(RecallParams {
             client: &self.client,
             cfg,
@@ -381,8 +398,16 @@ impl Inner {
             session_key: session_id,
             trigger: None,
             bridge: Some(frozen.clone()),
+            seen: seen.as_ref(),
         });
         let (recall, bridge) = tokio::join!(recall, frozen.clone());
+        if cfg.recall_reference {
+            // in the conversation once this turn is in it (a turn that fails before is not counted)
+            self.pending_shown
+                .lock()
+                .unwrap()
+                .insert(session_id.to_owned(), recall.shown.clone());
+        }
         if want_bridge {
             // the bridge is for the opening of a session only: whether or not it made it this time,
             // it is not tried again
@@ -506,6 +531,23 @@ impl Inner {
                 if self.excluded.lock().unwrap().contains(id) {
                     return;
                 }
+                if self.cfg.recall_reference {
+                    match e.kind.as_str() {
+                        // the engine takes old messages out of what the model sees (the history list stays as it is):
+                        // what the conversation held of the recall may not be there any more, so it is shown in full again
+                        "compacting" | "compacted" => {
+                            if self.forget_shown(id) {
+                                self.logger.info(&format!(
+                                    "{TAG} recallReference session={id}: the engine {} the conversation, its recall is shown in full again",
+                                    e.kind
+                                ));
+                            }
+                        }
+                        // the turn's message is in the conversation now
+                        "turn_completed" => self.commit_shown(id),
+                        _ => {}
+                    }
+                }
                 // any event is activity: a turn that runs longer than the idle limit is not idle
                 if !self.touch_event(id) {
                     return; // not a session that went through a Session, or one that is closed
@@ -524,6 +566,7 @@ impl Inner {
                 }
             }
             Notification::Recovered { session_id, .. } => {
+                let _ = self.forget_shown(&session_id);
                 // Only a session this extension follows is looked at again: the workers of a team are
                 // attached by the SDK too, and a session it has not seen before is only looked at when it
                 // takes a turn (a recovered engine must not back-fill every old session that was resumed).
@@ -531,9 +574,43 @@ impl Inner {
                     self.resync(Some(&session_id));
                 }
             }
-            Notification::Gap => self.resync(None),
+            Notification::Gap => {
+                self.forget_all_shown();
+                self.resync(None)
+            }
             _ => {}
         }
+    }
+
+    /// `recallReference`: the blocks of the turn that just completed are in the session's conversation now.
+    fn commit_shown(&self, session_id: &str) {
+        let Some(blocks) = self.pending_shown.lock().unwrap().remove(session_id) else {
+            return;
+        };
+        let mut shown = self.shown.lock().unwrap();
+        let seen = shown.entry(session_id.to_owned()).or_default();
+        if seen.len() + blocks.len() > SEEN_BLOCKS_MAX {
+            seen.clear();
+        }
+        seen.extend(blocks);
+    }
+
+    /// `recallReference`: what the session's conversation held of the recall is not relied on any more. Whether
+    /// there was anything.
+    fn forget_shown(&self, session_id: &str) -> bool {
+        let held = self
+            .shown
+            .lock()
+            .unwrap()
+            .remove(session_id)
+            .is_some_and(|seen| !seen.is_empty());
+        self.pending_shown.lock().unwrap().remove(session_id);
+        held
+    }
+
+    fn forget_all_shown(&self) {
+        self.shown.lock().unwrap().clear();
+        self.pending_shown.lock().unwrap().clear();
     }
 
     /// Events may have been missed: look at the history of one session, or of every session in use.
@@ -713,6 +790,7 @@ impl Inner {
             capture.release(id);
         }
         self.known.lock().unwrap().remove(id);
+        let _ = self.forget_shown(id);
     }
 
     /// Ends the sessions nobody has touched for `idle_end_ms`.
@@ -748,6 +826,7 @@ impl Inner {
                             capture.release(&id);
                         }
                         inner.known.lock().unwrap().remove(&id);
+                        let _ = inner.forget_shown(&id);
                     }
                 });
             }
@@ -890,7 +969,10 @@ impl Extension for HeliconExtension {
                     match events.recv().await {
                         Ok(n) => listener.on_notification(n),
                         // events were dropped: look at the history of every session in use
-                        Err(RecvError::Lagged(_)) => listener.resync(None),
+                        Err(RecvError::Lagged(_)) => {
+                            listener.forget_all_shown();
+                            listener.resync(None)
+                        }
                         Err(RecvError::Closed) => break,
                     }
                 }
@@ -1097,6 +1179,109 @@ mod tests {
             .filter(|r| r.path.starts_with("/v1/memory/session_bridge"))
             .count();
         assert_eq!(bridges, 1);
+    }
+
+    fn event(session: &str, kind: &str) -> Notification {
+        Notification::Event(crate::Event {
+            event_id: 1,
+            session_id: session.into(),
+            turn_id: None,
+            kind: kind.into(),
+            data: json!({}),
+        })
+    }
+
+    #[tokio::test]
+    async fn with_recall_reference_a_recall_the_conversation_holds_is_pointed_to_until_it_is_compacted(
+    ) {
+        let hs = MockHs::start(recall_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(
+            &hs,
+            dir.path(),
+            json!({"recallReference": true, "sessionBridge": false}),
+        );
+        let (s1, s2) = (session("s1"), session("s2"));
+        ext.on_session_created(&s1);
+        ext.on_session_created(&s2);
+        let inner = &ext.inner;
+        let prefix = |p: TurnAddition| p.user_prefix.unwrap();
+        let full = |p: &str| p.contains("- likes tea");
+        let pointer = |p: &str| {
+            p.contains("were all shown earlier in this conversation") && !p.contains("likes tea")
+        };
+
+        // the first turn shows the memory in full; until it has completed it is not in the conversation for sure
+        let p = prefix(parts(&ext, &s1, "sub-1", "what do I like to drink?", None).await);
+        assert!(full(&p), "{p}");
+        let p = prefix(parts(&ext, &s1, "sub-2", "and to eat?", None).await);
+        assert!(
+            full(&p),
+            "a turn that has not completed is not counted: {p}"
+        );
+        inner.on_notification(event("s1", "turn_completed"));
+
+        // now it is: the same memory is one line
+        let p = prefix(parts(&ext, &s1, "sub-3", "and what else do I like?", None).await);
+        assert!(pointer(&p), "{p}");
+        assert!(p.contains(&ID[..8]), "the line names the memory: {p}");
+        inner.on_notification(event("s1", "turn_completed"));
+        // another session has its own conversation
+        let p = prefix(parts(&ext, &s2, "sub-s2", "what do I like to drink?", None).await);
+        assert!(full(&p), "{p}");
+
+        // the engine compacted the conversation: what it held may be gone, so the memory is shown in full again
+        inner.on_notification(event("s1", "compacted"));
+        let p = prefix(parts(&ext, &s1, "sub-4", "so, what do I like?", None).await);
+        assert!(full(&p), "{p}");
+        inner.on_notification(event("s1", "turn_completed"));
+        let again = prefix(parts(&ext, &s1, "sub-5", "and now?", None).await);
+        assert!(pointer(&again), "{again}");
+        // a retry of the same submission gets the same text, even though the turn before it has completed since
+        inner.on_notification(event("s1", "turn_completed"));
+        assert_eq!(
+            prefix(parts(&ext, &s1, "sub-5", "and now?", None).await),
+            again
+        );
+
+        // events that may have been missed: not relied on any more
+        inner.on_notification(Notification::Gap);
+        let p = prefix(parts(&ext, &s1, "sub-6", "and again?", None).await);
+        assert!(full(&p), "{p}");
+        inner.on_notification(event("s1", "turn_completed"));
+        assert!(pointer(&prefix(
+            parts(&ext, &s1, "sub-7", "once more?", None).await
+        )));
+        // a recovered engine: the same
+        inner.on_notification(Notification::Recovered {
+            session_id: "s1".into(),
+            snapshot: json!({}),
+        });
+        let p = prefix(parts(&ext, &s1, "sub-8", "and after the recovery?", None).await);
+        assert!(full(&p), "{p}");
+    }
+
+    #[tokio::test]
+    async fn without_recall_reference_every_turn_shows_the_recall_in_full() {
+        let hs = MockHs::start(recall_hs()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ext = extension(&hs, dir.path(), json!({"sessionBridge": false}));
+        let s = session("s1");
+        ext.on_session_created(&s);
+        for (n, text) in ["first question", "second question"]
+            .into_iter()
+            .enumerate()
+        {
+            let p = parts(&ext, &s, &format!("sub-{n}"), text, None)
+                .await
+                .user_prefix
+                .unwrap();
+            assert!(
+                p.contains("- likes tea") && !p.contains("shown earlier"),
+                "{p}"
+            );
+            ext.inner.on_notification(event("s1", "turn_completed"));
+        }
     }
 
     async fn parts(

@@ -16,7 +16,8 @@ use super::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -264,6 +265,57 @@ pub(crate) struct ComposedRecall {
     pub kept_more: usize,
     /// The same item in another version, kept.
     pub other_version: usize,
+    /// The blocks shown in full this time that have an identity (`memory:<id>`, `topic:<name>`, `legend`), with
+    /// the hash of their text: what the session's history holds of the recall once this turn is in it.
+    pub injected: Vec<(String, u64)>,
+    /// Blocks left out because the session's history already holds exactly their text.
+    pub repeated: usize,
+}
+
+/// What a session's history already holds of the recall, block by block: the block's identity, and the hash of the
+/// text that was shown for it. (`recallReference`.)
+pub(crate) type SeenBlocks = HashMap<String, u64>;
+
+pub(crate) fn text_hash(text: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// The identity of a recall block, if it has one: the items the SessionBridge can show, and the legend (the
+/// same text every time).
+fn block_key(r: &Value) -> Option<String> {
+    if r["type"] == "legend" {
+        return Some("legend".to_owned());
+    }
+    shown_key(r)
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// What names an item in a pointer: the first 8 characters of a memory id (the full ids were listed
+/// when the item was first shown), a topic's name, a session summary's session.
+fn item_name(r: &Value) -> String {
+    match r["type"].as_str() {
+        Some("topic") => format!("topic \"{}\"", str_of(r, "topic_name")),
+        Some("session_summary") => format!("summary of {}", str_of(r, "session_id")),
+        _ => short_id(str_of(r, "memory_id")),
+    }
+}
+
+/// A pointer to an item whose text the session's history already holds, exactly.
+fn seen_pointer(r: &Value) -> String {
+    match r["type"].as_str() {
+        Some("topic") | Some("session_summary") => {
+            format!("\n• ({}: shown earlier in this conversation)", item_name(r))
+        }
+        _ => format!(
+            "\n• (memory {}: shown earlier in this conversation)",
+            item_name(r)
+        ),
+    }
 }
 
 /// The recalled context to inject this turn, from the server's blocks (`prompt_blocks`, protocol
@@ -274,10 +326,23 @@ pub(crate) struct ComposedRecall {
 /// `None` when the blocks are missing, of another protocol, or do not make up `prompt_text`: the
 /// server sends them with every `prompt_text`, so that is its fault — not passed over by injecting
 /// `prompt_text` without them.
+#[cfg(test)]
 pub(crate) fn compose_recall(
     resp: &Value,
     shown: Option<&BridgeShown>,
     min_score: f64,
+) -> Option<ComposedRecall> {
+    compose_recall_with(resp, shown, min_score, None)
+}
+
+/// `compose_recall`, and with `seen` (`recallReference`) also: a block whose text the session's history already
+/// holds, exactly, is not shown again; a pointer stands for it. When nothing of the recall is new, the whole
+/// recall is one line saying so.
+pub(crate) fn compose_recall_with(
+    resp: &Value,
+    shown: Option<&BridgeShown>,
+    min_score: f64,
+    seen: Option<&SeenBlocks>,
 ) -> Option<ComposedRecall> {
     let prompt_text = str_of(resp, "prompt_text");
     let pb = resp.get("prompt_blocks")?;
@@ -312,6 +377,9 @@ pub(crate) fn compose_recall(
     let mut visible: Vec<(String, String)> = Vec::new();
     let mut raws: Vec<(String, String, Option<String>)> = Vec::new();
     let (mut removed, mut kept_more, mut other_version) = (0, 0, 0);
+    let mut injected: Vec<(String, u64)> = Vec::new();
+    let mut repeated_names: Vec<String> = Vec::new();
+    let mut new_content = 0usize;
     for b in blocks {
         let r = &b["ref"];
         let there = match (shown, shown_key(r)) {
@@ -338,6 +406,24 @@ pub(crate) fn compose_recall(
                 other_version += 1;
             }
         }
+        let own_key = block_key(r);
+        let own_hash = text_hash(str_of(b, "text"));
+        if let (Some(seen), Some(key)) = (seen, own_key.as_ref()) {
+            if seen.get(key) == Some(&own_hash) {
+                // the same text is in the conversation already: the legend is not said again, an item is pointed to
+                if r["type"] != "legend" {
+                    out.push_str(&seen_pointer(r));
+                    repeated_names.push(item_name(r));
+                }
+                continue;
+            }
+        }
+        if let Some(key) = own_key {
+            injected.push((key, own_hash));
+        }
+        if !matches!(r["type"].as_str(), Some("legend") | Some("header")) {
+            new_content += 1;
+        }
         out.push_str(str_of(b, "text"));
         match r["type"].as_str() {
             Some("memory") => {
@@ -359,6 +445,23 @@ pub(crate) fn compose_recall(
             _ => {}
         }
     }
+    let repeated = repeated_names.len();
+    if repeated > 0 && new_content == 0 {
+        // nothing of this recall is new to the session
+        return Some(ComposedRecall {
+            text: format!(
+                "MEMORY RECALL — the memories found for this message ({}) were all shown earlier in this conversation.",
+                repeated_names.join(", ")
+            ),
+            id_index: (String::new(), 0),
+            raw_index: (String::new(), 0),
+            removed,
+            kept_more,
+            other_version,
+            injected: Vec::new(),
+            repeated,
+        });
+    }
     Some(ComposedRecall {
         text: out.trim().to_owned(),
         id_index: memory_id_index(&visible),
@@ -366,6 +469,8 @@ pub(crate) fn compose_recall(
         removed,
         kept_more,
         other_version,
+        injected,
+        repeated,
     })
 }
 
@@ -417,12 +522,16 @@ pub(crate) struct AutoRecallReport {
 pub(crate) struct AutoRecallResult {
     pub prepend_context: Option<String>,
     pub report: AutoRecallReport,
+    /// The recall blocks put into this turn in full, by identity and text hash (`recallReference`): the session's
+    /// history holds them once the turn is in it.
+    pub shown: Vec<(String, u64)>,
 }
 
 fn skipped(outcome: &'static str) -> AutoRecallResult {
     AutoRecallResult {
         prepend_context: None,
         report: AutoRecallReport { outcome },
+        shown: Vec::new(),
     }
 }
 
@@ -441,6 +550,9 @@ pub(crate) struct RecallParams<'a> {
     /// What the SessionBridge injected this turn shows, as frozen for this turn: items it shows whole
     /// are not shown again. Asked only when composing; the same answer decides the bridge's injection.
     pub bridge: Option<FrozenBridge>,
+    /// `recallReference`: what the session's history already holds of the recall; blocks with the same text
+    /// are pointed to, not shown again.
+    pub seen: Option<&'a SeenBlocks>,
 }
 
 pub(crate) async fn perform_auto_recall(p: RecallParams<'_>) -> AutoRecallResult {
@@ -564,7 +676,8 @@ pub(crate) async fn perform_auto_recall(p: RecallParams<'_>) -> AutoRecallResult
         Some(b) => b.clone().await,
         None => super::bridge::BridgeTurn::Omitted("not asked".into()),
     };
-    let Some(composed) = compose_recall(&resp, frozen.shown(), cfg.recall_min_score) else {
+    let Some(composed) = compose_recall_with(&resp, frozen.shown(), cfg.recall_min_score, p.seen)
+    else {
         logger.warn(&format!(
             "{TAG} auto_recall not injected: prompt_text came without usable prompt_blocks (protocol={}, expected {BLOCKS_PROTOCOL}) elapsedMs={elapsed}",
             resp["prompt_blocks"]["protocol"].as_str().unwrap_or("none")
@@ -581,8 +694,8 @@ pub(crate) async fn perform_auto_recall(p: RecallParams<'_>) -> AutoRecallResult
         composed.text, composed.id_index.0, composed.raw_index.0
     ));
     logger.info(&format!(
-        "{TAG} auto_recall injected organized memory (grounded={grounded} rawTurns={raw_turns} idIndex={} rawRefs={} skillsBlock={skills_count} shownInBridge={} keptMore={} otherVersion={}) elapsedMs={elapsed}",
-        composed.id_index.1, composed.raw_index.1, composed.removed, composed.kept_more, composed.other_version
+        "{TAG} auto_recall injected organized memory (grounded={grounded} rawTurns={raw_turns} idIndex={} rawRefs={} skillsBlock={skills_count} shownInBridge={} keptMore={} otherVersion={} repeated={}) elapsedMs={elapsed}",
+        composed.id_index.1, composed.raw_index.1, composed.removed, composed.kept_more, composed.other_version, composed.repeated
     ));
     // the injected block is otherwise invisible: without this "the model said it has no such memory"
     // cannot be told apart from "the memory was never injected"
@@ -595,6 +708,7 @@ pub(crate) async fn perform_auto_recall(p: RecallParams<'_>) -> AutoRecallResult
         report: AutoRecallReport {
             outcome: "injected",
         },
+        shown: composed.injected,
     }
 }
 
@@ -696,6 +810,133 @@ mod tests {
             .contains(&format!("(memory {ID_A}: shown above under 跨会话记忆)")));
         assert!(c.text.contains("- likes tea (said 2025)"));
         assert!(c.text.contains("- other"));
+    }
+
+    fn memory_block(text: &str, id: &str) -> Value {
+        block(
+            text,
+            json!({"type": "memory", "memory_id": id, "version": "v1", "extras": []}),
+        )
+    }
+
+    /// A recall of the legend, a header and two memories (the first one with the given text), and more blocks.
+    fn recall_of(tea: &str, more: Vec<Value>) -> Value {
+        let mut list = vec![
+            block("MEMORY RECALL legend\n", json!({"type": "legend"})),
+            block(
+                "\n\n## FACTS\n",
+                json!({"type": "header", "section": "FACTS"}),
+            ),
+            memory_block(tea, ID_A),
+            memory_block("\n• likes coffee\n", ID_B),
+        ];
+        list.extend(more);
+        blocks(list)
+    }
+
+    #[test]
+    fn a_block_whose_text_the_conversation_holds_is_pointed_to_and_only_new_text_is_shown_in_full()
+    {
+        let first =
+            compose_recall_with(&recall_of("\n• likes tea\n", vec![]), None, 0.01, None).unwrap();
+        assert_eq!(first.repeated, 0);
+        let keys: Vec<String> = first.injected.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "legend".to_owned(),
+                format!("memory:{ID_A}"),
+                format!("memory:{ID_B}")
+            ],
+            "the legend and the two memories have an identity, the header has none"
+        );
+        let seen: SeenBlocks = first.injected.iter().cloned().collect();
+
+        // the same recall again: nothing of it is new, one line says so
+        let again = compose_recall_with(
+            &recall_of("\n• likes tea\n", vec![]),
+            None,
+            0.01,
+            Some(&seen),
+        )
+        .unwrap();
+        assert_eq!(again.repeated, 2);
+        assert_eq!(
+            again.text,
+            format!(
+                "MEMORY RECALL — the memories found for this message ({}, {}) were all shown earlier in this conversation.",
+                &ID_A[..8],
+                &ID_B[..8]
+            )
+        );
+        assert!(again.injected.is_empty());
+        assert_eq!((again.id_index.1, again.raw_index.1), (0, 0));
+
+        // a changed text and a new item are shown in full, the unchanged one is pointed to, the legend is not said again
+        let newer = recall_of(
+            "\n• likes tea (said 2025)\n",
+            vec![memory_block(
+                "\n• new fact\n",
+                "cccccccccccccccccccccccccccccccc",
+            )],
+        );
+        let c = compose_recall_with(&newer, None, 0.01, Some(&seen)).unwrap();
+        assert_eq!(c.repeated, 1);
+        assert!(
+            c.text.contains("• likes tea (said 2025)") && c.text.contains("• new fact"),
+            "{}",
+            c.text
+        );
+        assert!(
+            c.text.contains(&format!(
+                "(memory {}: shown earlier in this conversation)",
+                &ID_B[..8]
+            )),
+            "{}",
+            c.text
+        );
+        assert!(
+            !c.text.contains("MEMORY RECALL legend") && c.text.contains("## FACTS"),
+            "{}",
+            c.text
+        );
+        assert_eq!(
+            c.injected.len(),
+            2,
+            "the changed item and the new one: {:?}",
+            c.injected
+        );
+
+        // an excerpt of the conversation is something new: not one line, the memories it sits with are pointed to
+        let with_raw = recall_of(
+            "\n• likes tea\n",
+            vec![block(
+                "\n[R1] said hi\n",
+                json!({"type": "raw", "session_id": "openworker/s1", "turns": "3-4", "orphan": false, "label": "R1"}),
+            )],
+        );
+        let c = compose_recall_with(&with_raw, None, 0.01, Some(&seen)).unwrap();
+        assert_eq!(c.repeated, 2);
+        assert!(
+            c.text.contains("[R1] said hi")
+                && c.text.contains("shown earlier in this conversation"),
+            "{}",
+            c.text
+        );
+    }
+
+    #[test]
+    fn without_a_record_of_the_conversation_nothing_is_pointed_to() {
+        let c = compose_recall_with(
+            &recall_of("\n• likes tea\n", vec![]),
+            None,
+            0.01,
+            Some(&SeenBlocks::new()),
+        )
+        .unwrap();
+        assert_eq!(c.repeated, 0);
+        assert!(c.text.contains("• likes tea") && c.text.contains("MEMORY RECALL legend"));
+        assert!(!c.text.contains("shown earlier"));
     }
 
     #[test]
