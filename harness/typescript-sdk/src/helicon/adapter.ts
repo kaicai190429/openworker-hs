@@ -26,7 +26,7 @@ import { wrapRelevantMemoriesBlock } from "./filters.js";
 import { createFileLogger } from "./log.js";
 import { HeliconMediaClient } from "./media-client.js";
 import { registerMediaTools } from "./media-tools.js";
-import { performAutoRecall } from "./recall.js";
+import { performAutoRecall, type SeenBlocks } from "./recall.js";
 import { HookBudget, RecallBudgets } from "./recall-budget.js";
 import { BRIDGE_PROTOCOL, formatBridgeContext, freezeBridgeBy, type BridgeTurn } from "./session-bridge.js";
 import { imageExtension, type ImageAttachment } from "./registry.js";
@@ -37,6 +37,8 @@ const PLUGIN_ID = "helicon-memory";
 /** The engine accepts at most this much application addendum per turn (UTF-8 bytes). */
 const MAX_ADDENDUM_BYTES = 32_000;
 const SUBMISSION_CACHE_MAX = 256;
+/** `recallReference`: most recall blocks a session's record may hold (one that grows past it starts again) */
+const SEEN_BLOCKS_MAX = 512;
 /** `close()` holds the application for the memory work no longer than the extraction wait plus this. */
 const CLOSE_MARGIN_MS = 15_000;
 /** `shutdown()` holds the application no longer than this for the memory work. */
@@ -141,6 +143,10 @@ export class HeliconAdapter {
   /** files the user attached, by session: media_upload with no paths adds these */
   private readonly attached = new BoundedMap<string[]>(200);
   private readonly recalled = new Map<string, string | undefined>();
+  /** `recallReference`: per session, the recall blocks its conversation holds (identity, hash of the text shown) ... */
+  private readonly shown = new BoundedMap<SeenBlocks>(256);
+  /** ... and the blocks of the turn in flight, which join them when the turn completes */
+  private readonly pendingShown = new BoundedMap<Array<[string, string]>>(256);
   private unsubscribe: (() => void) | undefined;
   private idleTimer: ReturnType<typeof setInterval> | undefined;
   /** sessions this process created, resumed or took a turn in, and has not closed: what shutdown and idling look at */
@@ -412,6 +418,7 @@ export class HeliconAdapter {
       : Promise.resolve<BridgeTurn>({ state: "omitted", why: "not the first turn" });
     const frozen = freezeBridgeBy(bridgeTurn, budget.composeByMs());
 
+    const seen: SeenBlocks | undefined = cfg.recallReference ? (this.shown.get(sessionId) ?? new Map<string, string>()) : undefined;
     const recall = cfg.autoRecall
       ? await performAutoRecall({
           client: this.client,
@@ -423,9 +430,12 @@ export class HeliconAdapter {
           budgets: this.budgets,
           sessionKey: sessionId,
           bridgeShown: () => frozen.then((b) => (b.state === "omitted" ? null : b.rendering.shown)),
+          ...(seen ? { seen } : {}),
         })
-      : { report: { outcome: "skipped" as const }, prependContext: undefined };
+      : { report: { outcome: "skipped" as const }, prependContext: undefined, shown: [] as Array<[string, string]> };
     const bridge = await frozen;
+    // in the conversation once this turn is in it (a turn that fails before is not counted)
+    if (cfg.recallReference) this.pendingShown.set(sessionId, recall.shown ?? []);
 
     if (wantBridge) {
       // the bridge is for the opening of a session only: whether or not it made it this time, it is not tried again
@@ -522,13 +532,49 @@ export class HeliconAdapter {
     }
   }
 
+  /** `recallReference`: the blocks of the turn that just completed are in the session's conversation now. */
+  private commitShown(sessionId: string): void {
+    const blocks = this.pendingShown.get(sessionId);
+    if (!blocks) return;
+    this.pendingShown.delete(sessionId);
+    let seen = this.shown.get(sessionId);
+    if (!seen || seen.size + blocks.length > SEEN_BLOCKS_MAX) seen = new Map();
+    for (const [key, hash] of blocks) seen.set(key, hash);
+    this.shown.set(sessionId, seen);
+  }
+
+  /** `recallReference`: what the session's conversation held of the recall is not relied on any more. Whether there was anything. */
+  private forgetShown(sessionId: string): boolean {
+    const held = (this.shown.get(sessionId)?.size ?? 0) > 0;
+    this.shown.delete(sessionId);
+    this.pendingShown.delete(sessionId);
+    return held;
+  }
+
+  private forgetAllShown(): void {
+    this.shown.clear();
+    this.pendingShown.clear();
+  }
+
   private onJournal(method: string, params: unknown): void {
     if (method === "stream/gap") {
+      this.forgetAllShown(); // events may have been missed, among them a compaction
       for (const id of this.capture.sessions()) this.capture.schedule(id);
       return;
     }
     if (method !== "session/event") return;
     const e = params as { type?: unknown; session_id?: unknown } | null;
+    if (this.cfg.recallReference && typeof e?.session_id === "string" && typeof e.type === "string" && !this.excluded.has(e.session_id)) {
+      if (e.type === "compacting" || e.type === "compacted") {
+        // the engine takes old messages out of what the model sees (the history list stays as it is): what the conversation
+        // held of the recall may not be there any more, so it is shown in full again
+        if (this.forgetShown(e.session_id)) {
+          this.logger.info(`[${PLUGIN_ID}] recallReference session=${e.session_id}: the engine ${e.type === "compacting" ? "is compacting" : "compacted"} the conversation, its recall is shown in full again`);
+        }
+      } else if (e.type === "turn_completed") {
+        this.commitShown(e.session_id); // the turn's message is in the conversation now
+      }
+    }
     if (typeof e?.session_id === "string" && typeof e.type === "string" && TURN_ENDED.has(e.type)) {
       this.running.delete(e.session_id);
     }
@@ -621,6 +667,7 @@ export class HeliconAdapter {
     this.known.delete(sessionId);
     this.leads.delete(sessionId);
     this.savedAt.delete(sessionId);
+    this.forgetShown(sessionId);
   }
 
   /** `session.close()` failed after `onSessionClose` let go of the session (the engine refused it, say because a turn is still running): it is open still, so it is followed again. */

@@ -6,6 +6,7 @@
  * blocked by an offline / slow heliconsearch.
  */
 
+import { createHash } from "node:crypto";
 import type { MemoryConfig } from "./config.js";
 import {
   isAutomatedTurn,
@@ -259,7 +260,41 @@ export type ComposedRecall = {
   keptMore: number;
   /** the same item in another version, kept */
   otherVersion: number;
+  /**
+   * the blocks shown in full this time that have an identity (`memory:<id>`, `topic:<name>`, `legend`), with the hash of
+   * their text: what the session's conversation holds of the recall once this turn is in it
+   */
+  injected: Array<[string, string]>;
+  /** blocks left out because the session's conversation already holds exactly their text */
+  repeated: number;
 };
+
+/** What a session's conversation already holds of the recall, block by block: the block's identity, the hash of the text shown (`recallReference`). */
+export type SeenBlocks = Map<string, string>;
+
+function textHash(text: string): string {
+  return createHash("sha1").update(text).digest("hex");
+}
+
+/** The identity of a recall block, if it has one: the items the SessionBridge can show, and the legend (the same text every time). */
+function blockKey(ref: PromptBlockRef): string | null {
+  return ref.type === "legend" ? "legend" : shownKey(ref);
+}
+
+/** What names an item in a pointer: the first 8 characters of a memory id (the full ids were listed when it was first shown), a topic's name, a summary's session. */
+function itemName(ref: PromptBlockRef): string {
+  if (ref.type === "topic") return `topic "${ref.topic_name}"`;
+  if (ref.type === "session_summary") return `summary of ${ref.session_id}`;
+  return (ref.type === "memory" ? ref.memory_id ?? "" : "").slice(0, 8);
+}
+
+/** A pointer to an item whose text the session's conversation already holds, exactly. */
+function seenPointer(ref: PromptBlockRef): string {
+  const name = itemName(ref);
+  return ref.type === "topic" || ref.type === "session_summary"
+    ? `\n• (${name}: shown earlier in this conversation)`
+    : `\n• (memory ${name}: shown earlier in this conversation)`;
+}
 
 /**
  * The recalled context to inject this turn, from the server's blocks (prompt_blocks, protocol
@@ -279,6 +314,7 @@ export function composeRecall(
   resp: QueryResponse,
   shown: BridgeShown | null,
   minScore: number,
+  seen?: SeenBlocks | null,
 ): ComposedRecall | null {
   const promptText = resp.prompt_text ?? "";
   const pb = resp.prompt_blocks;
@@ -302,6 +338,9 @@ export function composeRecall(
   const visible: { memoryId: string | null; claim: string }[] = [];
   const raws: { label: string; session: string; turns: string | null }[] = [];
   let removed = 0, keptMore = 0, otherVersion = 0;
+  const injected: Array<[string, string]> = [];
+  const repeatedNames: string[] = [];
+  let newContent = 0;
   for (const b of pb.blocks) {
     const key = shownKey(b.ref);
     const there = key && shown ? shown.complete.get(key) : undefined;
@@ -321,6 +360,18 @@ export function composeRecall(
         otherVersion++;
       }
     }
+    const ownKey = blockKey(b.ref);
+    const ownHash = textHash(b.text);
+    if (seen && ownKey !== null && seen.get(ownKey) === ownHash) {
+      // the same text is in the conversation already: the legend is not said again, an item is pointed to
+      if (b.ref.type !== "legend") {
+        out.push(seenPointer(b.ref));
+        repeatedNames.push(itemName(b.ref));
+      }
+      continue;
+    }
+    if (ownKey !== null) injected.push([ownKey, ownHash]);
+    if (b.ref.type !== "legend" && b.ref.type !== "header") newContent++;
     out.push(b.text);
     if (b.ref.type === "memory" && b.ref.memory_id) {
       const f = facts.get(b.ref.memory_id);
@@ -332,8 +383,18 @@ export function composeRecall(
                   turns: b.ref.turns === null || b.ref.turns === undefined ? null : String(b.ref.turns) });
     }
   }
+  const repeated = repeatedNames.length;
+  if (repeated > 0 && newContent === 0) {
+    // nothing of this recall is new to the session
+    return {
+      text: `MEMORY RECALL — the memories found for this message (${repeatedNames.join(", ")}) were all shown earlier in this conversation.`,
+      idIndex: { text: "", count: 0 },
+      rawIndex: { text: "", count: 0 },
+      removed, keptMore, otherVersion, injected: [], repeated,
+    };
+  }
   return { text: out.join("").trim(), idIndex: memoryIdIndex(visible), rawIndex: rawRefIndex(raws),
-           removed, keptMore, otherVersion };
+           removed, keptMore, otherVersion, injected, repeated };
 }
 
 /** What one turn's automatic recall did, for the hook's summary line. */
@@ -360,6 +421,8 @@ export type AutoRecallReport = {
 export type AutoRecallResult = {
   prependContext?: string;
   report: AutoRecallReport;
+  /** the recall blocks put into this turn in full, by identity and text hash (`recallReference`) */
+  shown?: Array<[string, string]>;
 };
 
 /**
@@ -402,6 +465,8 @@ export async function performAutoRecall(params: {
    * again (composeRecall). Asked only when composing; the same answer decides the bridge's injection.
    */
   bridgeShown?: () => Promise<BridgeShown | null>;
+  /** `recallReference`: what the session's conversation already holds of the recall; blocks with the same text are pointed to, not shown again */
+  seen?: SeenBlocks;
 }): Promise<AutoRecallResult> {
   const startedMs = Date.now();
   const { client, cfg, prompt, messages, logger, signal, sessionKey, trigger, hookBudget, budgets } = params;
@@ -520,7 +585,7 @@ export async function performAutoRecall(params: {
     } catch {
       shown = null;                    // no bridge this turn: nothing to leave out
     }
-    const composed = composeRecall(resp, shown, cfg.recallMinScore);
+    const composed = composeRecall(resp, shown, cfg.recallMinScore, params.seen);
     if (!composed) {
       logger.warn(
         `[${PLUGIN_ID}] auto_recall not injected: prompt_text came without usable prompt_blocks ` +
@@ -537,7 +602,7 @@ export async function performAutoRecall(params: {
     );
 
     logger.info(
-      `[${PLUGIN_ID}] auto_recall injected organized memory (grounded=${grounded.length} rawTurns=${rawTurns} idIndex=${idIndex.count} rawRefs=${rawIndex.count} skillsBlock=${skillsBlock.count} shownInBridge=${composed.removed} keptMore=${composed.keptMore} otherVersion=${composed.otherVersion}) elapsedMs=${elapsedMs}`,
+      `[${PLUGIN_ID}] auto_recall injected organized memory (grounded=${grounded.length} rawTurns=${rawTurns} idIndex=${idIndex.count} rawRefs=${rawIndex.count} skillsBlock=${skillsBlock.count} shownInBridge=${composed.removed} keptMore=${composed.keptMore} otherVersion=${composed.otherVersion} repeated=${composed.repeated}) elapsedMs=${elapsedMs}`,
     );
     if (cfg.debug) {
       // The injected block is otherwise invisible: llm_input logs only the user's own
@@ -554,11 +619,12 @@ export async function performAutoRecall(params: {
 
     return {
       prependContext,
+      shown: composed.injected,
       report: {
         outcome: "injected", ...base,
         // (content blocks shown whole: not the legend or headers, not those left to the bridge)
         blocks: (pb?.blocks ?? []).filter((b) => b.ref.type !== "legend" && b.ref.type !== "header").length
-          - composed.removed,
+          - composed.removed - composed.repeated,
         chars: prependContext.length,
       },
     };

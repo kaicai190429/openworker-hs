@@ -127,6 +127,11 @@ export type MemoryConfig = {
   memoryStoreTool: boolean;
   captureMode: CaptureMode;
   recallPlacement: RecallPlacement;
+  /**
+   * With `recallPlacement: "user"`: a recalled item whose text the conversation already holds is pointed to, not shown
+   * again (a recall of items it all holds is one line). What the conversation holds is forgotten when the engine compacts it.
+   */
+  recallReference: boolean;
   captureMaxChars: number;
   storeGate: boolean;
   recallGate: boolean;
@@ -185,6 +190,7 @@ const ALLOWED_KEYS = [
   "memoryStoreTool",
   "captureMode",
   "recallPlacement",
+  "recallReference",
   "captureMaxChars",
   "storeGate",
   "recallGate",
@@ -465,6 +471,12 @@ export const memoryConfigSchema = {
     const debug = parseBoolean(cfg.debug, false);
     const captureMode = parseCaptureMode(cfg.captureMode);
     const recallPlacement = parseRecallPlacement(cfg.recallPlacement);
+    const recallReference = parseBoolean(cfg.recallReference, false);
+    if (recallReference && recallPlacement !== "user") {
+      throw new Error(
+        'recallReference needs recallPlacement "user": it points to text the conversation holds, and a recall in the instructions is not part of the conversation',
+      );
+    }
     // 服务端的 StoreGate（heliconsearch services/memory/store_gate.py）默认关，由这里显式
     // 打开：抽取前判一次「这段里用户有没有引入值得长期记住的新信息」，没有就整段不抽。
     // 默认 true —— 闸门要挡的正是 agent 会话这一侧的噪声（ping / 心跳轮询 / 纯回忆提问），
@@ -577,6 +589,7 @@ export const memoryConfigSchema = {
       memoryStoreTool,
       captureMode,
       recallPlacement,
+      recallReference,
       captureMaxChars,
       storeGate,
       recallGate,

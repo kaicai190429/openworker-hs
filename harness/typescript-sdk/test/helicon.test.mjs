@@ -1411,3 +1411,122 @@ test("memory_recall lists facts the server has not verified yet, after the groun
     assert.match(both, /2\. \[needs_verification\] user likes jasmine tea/);
   } finally { await t.done(); }
 });
+
+// ── recallReference: a recall the conversation holds is pointed to, not shown again ─────────────────────────────
+
+test("recallReference is off by default and needs the recall in the user's message", async () => {
+  const env = {};
+  const cfgOf = async (extra) => loadHeliconConfig(await stateWith({ baseUrl: "http://127.0.0.1:5001", apiKey: "k", ...extra }), env);
+  assert.equal((await cfgOf({})).cfg.recallReference, false);
+  assert.equal((await cfgOf({ recallReference: true })).cfg.recallReference, true);
+  assert.equal((await cfgOf({ recallPlacement: "user", recallReference: true })).cfg.recallReference, true);
+  assert.equal((await cfgOf({ recallPlacement: "system", recallReference: false })).cfg.recallReference, false);
+  const refused = await cfgOf({ recallPlacement: "system", recallReference: true });
+  assert.equal(refused.status, "invalid");
+  assert.match(refused.reason, /recallReference needs recallPlacement/);
+  const notBool = await cfgOf({ recallReference: "yes" });
+  assert.equal(notBool.status, "invalid");
+  assert.match(notBool.reason, /expected boolean/);
+});
+
+test("with recallReference a recall the conversation holds is pointed to until it is compacted", async () => {
+  const t = await attach({}, { recallPlacement: "user", recallReference: true, sessionBridge: false });
+  try {
+    const prefix = async (sessionId, sub, text) => (await t.adapter.prepareTurnParts({ sessionId, text, submissionId: sub })).userPrefix;
+    const full = (p) => p.includes("• user likes teal");
+    const pointer = (p) => /\([0-9a-f]{8}\) were all shown earlier in this conversation/.test(p) && !p.includes("likes teal");
+    const completed = (sid) => t.harness.emit("session/event", { type: "turn_completed", session_id: sid });
+    t.adapter.onSessionCreated("s_r1");
+    t.adapter.onSessionCreated("s_r2");
+
+    // the first turn shows the memory in full; until it has completed it is not in the conversation for sure
+    assert.ok(full(await prefix("s_r1", "r1", "what do I like to drink?")));
+    assert.ok(full(await prefix("s_r1", "r2", "and to eat?")), "a turn that has not completed is not counted");
+    completed("s_r1");
+
+    // now it is: the same memory is one line
+    const p3 = await prefix("s_r1", "r3", "and what else do I like?");
+    assert.ok(pointer(p3), p3);
+    completed("s_r1");
+    // another session has its own conversation
+    assert.ok(full(await prefix("s_r2", "r-other", "what do I like to drink?")));
+
+    // the engine compacted the conversation: what it held may be gone, so the memory is shown in full again
+    t.harness.emit("session/event", { type: "compacted", session_id: "s_r1" });
+    assert.ok(full(await prefix("s_r1", "r4", "so, what do I like?")));
+    completed("s_r1");
+    const again = await prefix("s_r1", "r5", "and now?");
+    assert.ok(pointer(again), again);
+    // a retry of the same submission gets the same text, even though a turn has completed since
+    completed("s_r1");
+    assert.equal(await prefix("s_r1", "r5", "and now?"), again);
+
+    // events that may have been missed: not relied on any more
+    t.harness.emit("stream/gap", {});
+    assert.ok(full(await prefix("s_r1", "r6", "and again?")));
+    completed("s_r1");
+    assert.ok(pointer(await prefix("s_r1", "r7", "once more?")));
+
+    // a closed session starts again
+    await t.adapter.onSessionClose("s_r1");
+    t.adapter.onSessionCreated("s_r1");
+    assert.ok(full(await prefix("s_r1", "r8", "after the close?")));
+  } finally { await t.done(); }
+});
+
+import { composeRecall } from "../dist/helicon/recall.js";
+
+test("composeRecall points to the blocks the conversation holds and shows the rest in full", () => {
+  const A = "a".repeat(32), B = "b".repeat(32), C = "c".repeat(32);
+  const mem = (text, id) => ({ text, ref: { type: "memory", memory_id: id, version: "v1", extras: [], unverified: false } });
+  const recall = (tea, more = []) => {
+    const blocks = [{ text: "LEGEND\n", ref: { type: "legend" } }, { text: "\n\n## FACTS\n", ref: { type: "header", section: "FACTS" } }, mem(tea, A), mem("\n• likes coffee\n", B), ...more];
+    return { prompt_text: blocks.map((b) => b.text).join(""), prompt_blocks: { protocol: "blocks.v1", blocks }, grounded_facts: [], needs_verification: [], conflicts: [] };
+  };
+  const first = composeRecall(recall("\n• likes tea\n"), null, 0.01);
+  assert.equal(first.repeated, 0);
+  assert.deepEqual(first.injected.map(([k]) => k), ["legend", `memory:${A}`, `memory:${B}`], "the legend and the two memories have an identity, the header has none");
+  const seen = new Map(first.injected);
+
+  // the same recall again: nothing of it is new, one line says so
+  const again = composeRecall(recall("\n• likes tea\n"), null, 0.01, seen);
+  assert.equal(again.repeated, 2);
+  assert.equal(again.text, `MEMORY RECALL — the memories found for this message (${A.slice(0, 8)}, ${B.slice(0, 8)}) were all shown earlier in this conversation.`);
+  assert.deepEqual(again.injected, []);
+  assert.equal(again.idIndex.count + again.rawIndex.count, 0);
+
+  // a changed text and a new item are shown in full, the unchanged one is pointed to, the legend is not said again
+  const c = composeRecall(recall("\n• likes tea (said 2025)\n", [mem("\n• new fact\n", C)]), null, 0.01, seen);
+  assert.equal(c.repeated, 1);
+  assert.match(c.text, /• likes tea \(said 2025\)/);
+  assert.match(c.text, /• new fact/);
+  assert.match(c.text, new RegExp(`\\(memory ${B.slice(0, 8)}: shown earlier in this conversation\\)`));
+  assert.doesNotMatch(c.text, /LEGEND/);
+  assert.match(c.text, /## FACTS/);
+  assert.equal(c.injected.length, 2, "the changed item and the new one");
+
+  // an excerpt of the conversation is something new: not one line, the memories it sits with are pointed to
+  const raw = composeRecall(recall("\n• likes tea\n", [{ text: "\n[R1] said hi\n", ref: { type: "raw", session_id: "openworker/s1", turns: "3-4", orphan: false, label: "R1" } }]), null, 0.01, seen);
+  assert.equal(raw.repeated, 2);
+  assert.match(raw.text, /\[R1\] said hi/);
+  assert.match(raw.text, /shown earlier in this conversation/);
+
+  // without a record nothing is pointed to
+  const none = composeRecall(recall("\n• likes tea\n"), null, 0.01, new Map());
+  assert.equal(none.repeated, 0);
+  assert.match(none.text, /LEGEND/);
+  assert.doesNotMatch(none.text, /shown earlier/);
+});
+
+test("without recallReference every turn shows the recall in full", async () => {
+  const t = await attach({}, { recallPlacement: "user", sessionBridge: false });
+  try {
+    t.adapter.onSessionCreated("s_f");
+    for (const [n, text] of ["first question here", "second question here"].entries()) {
+      const p = (await t.adapter.prepareTurnParts({ sessionId: "s_f", text, submissionId: `f${n}` })).userPrefix;
+      assert.match(p, /• user likes teal/);
+      assert.doesNotMatch(p, /shown earlier/);
+      t.harness.emit("session/event", { type: "turn_completed", session_id: "s_f" });
+    }
+  } finally { await t.done(); }
+});

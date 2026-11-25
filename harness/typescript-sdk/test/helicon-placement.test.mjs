@@ -100,3 +100,23 @@ test("without the option the recall is in front of the user's message", async (t
     await session.close();
   } finally { await s.done(); }
 });
+
+test("with recallReference the second message carries a one-line pointer, not the recall again", async (t) => {
+  const s = await start(t, { recallPlacement: "user", recallReference: true });
+  if (!s) return;
+  try {
+    const session = await s.agent.newSession();
+    await session.run("What tea do I like?");
+    await new Promise((resolve) => setTimeout(resolve, 300)); // (the journal event of the finished turn reaches the adapter)
+    await session.run("And coffee?");
+    const users = userTexts(s.model.requests.at(-1));
+    assert.ok(users[0].includes("user likes teal"), "the first message holds the recall");
+    assert.match(users.at(-1), /were all shown earlier in this conversation/);
+    assert.doesNotMatch(users.at(-1), /user likes teal/);
+    assert.ok(users.at(-1).endsWith("</relevant-memories>\n\nAnd coffee?"), users.at(-1));
+    // HeliconSearch's archive is without either
+    await session.close();
+    const said = s.hs.calls.filter((c) => c.path === "/v1/memory/session/turn").flatMap((c) => c.body.turns).filter((x) => x.role === "user");
+    assert.deepEqual(said.map((x) => x.content), ["What tea do I like?", "And coffee?"]);
+  } finally { await s.done(); }
+});
