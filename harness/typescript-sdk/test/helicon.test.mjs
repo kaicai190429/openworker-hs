@@ -1481,7 +1481,9 @@ test("composeRecall points to the blocks the conversation holds and shows the re
   const mem = (text, id) => ({ text, ref: { type: "memory", memory_id: id, version: "v1", extras: [], unverified: false } });
   const recall = (tea, more = []) => {
     const blocks = [{ text: "LEGEND\n", ref: { type: "legend" } }, { text: "\n\n## FACTS\n", ref: { type: "header", section: "FACTS" } }, mem(tea, A), mem("\n• likes coffee\n", B), ...more];
-    return { prompt_text: blocks.map((b) => b.text).join(""), prompt_blocks: { protocol: "blocks.v1", blocks }, grounded_facts: [], needs_verification: [], conflicts: [] };
+    // (the two memories have facts, so the index lists their ids)
+    const grounded = [{ id: "pkg:a", claim: "likes tea", score: 0.9, source_memory_ids: [A] }, { id: "pkg:b", claim: "likes coffee", score: 0.9, source_memory_ids: [B] }];
+    return { prompt_text: blocks.map((b) => b.text).join(""), prompt_blocks: { protocol: "blocks.v1", blocks }, grounded_facts: grounded, needs_verification: [], conflicts: [] };
   };
   const first = composeRecall(recall("\n• likes tea\n"), null, 0.01);
   assert.equal(first.repeated, 0);
@@ -1529,4 +1531,49 @@ test("without recallReference every turn shows the recall in full", async () => 
       t.harness.emit("session/event", { type: "turn_completed", session_id: "s_f" });
     }
   } finally { await t.done(); }
+});
+
+// a memory whose id the MEMORY_IDS index did not list (it lists 5) is pointed to with the start of its text as well
+
+const manyMemories = (n, score = 0.9) => {
+  const id = (i) => `${(i + 1).toString(16).padStart(8, "0")}${"0".repeat(24)}`;
+  const claim = (i) => `CFO, Kestrel Labs · item${i}.key: ${"long text ".repeat(12)}`;
+  const blocks = Array.from({ length: n }, (_, i) => ({ text: `\n• ${claim(i)}\n`, ref: { type: "memory", memory_id: id(i), version: "v1", extras: [], unverified: false } }));
+  return {
+    claim,
+    resp: {
+      prompt_text: blocks.map((b) => b.text).join(""), prompt_blocks: { protocol: "blocks.v1", blocks },
+      grounded_facts: blocks.map((_, i) => ({ id: `pkg:${i}`, claim: claim(i), score, source_memory_ids: [id(i)] })), needs_verification: [], conflicts: [],
+    },
+  };
+};
+const snippetOf = (claim) => claim.replace(/\s+/g, " ").trim().slice(0, 60).trim();
+
+test("composeRecall points to a memory the id index did not list with the start of its text", () => {
+  const { resp, claim } = manyMemories(7);
+  const first = composeRecall(resp, null, 0.01);
+  // the index lists 5 ids: the 6th and the 7th memory have no id in the text the conversation holds
+  assert.equal(first.idIndex.count, 5);
+  assert.deepEqual(first.injected.map(([, s]) => s.needsLabel), [false, false, false, false, false, true, true]);
+  const seen = new Map(first.injected);
+
+  // all of it again: one line; the listed memories by their ids, the others with the start of their text too
+  const again = composeRecall(resp, null, 0.01, seen);
+  assert.equal(again.repeated, 7);
+  const snippet = snippetOf(claim(5));
+  assert.ok(snippet.length <= 60 && snippet.startsWith("CFO, Kestrel Labs · item5.key:"), snippet);
+  assert.ok(again.text.includes(`00000006 "${snippet}"`), again.text);
+  assert.ok(again.text.includes("00000001,") && !again.text.includes('00000001 "'), again.text);
+
+  // with something new beside them: a pointer per memory, and the label where it is needed
+  const next = composeRecall(manyMemories(8).resp, null, 0.01, seen);
+  assert.equal(next.repeated, 7);
+  assert.ok(next.text.includes(`• (memory 00000007 "${snippetOf(claim(6))}": shown earlier in this conversation)`), next.text);
+  assert.ok(next.text.includes("• (memory 00000001: shown earlier in this conversation)"), next.text);
+});
+
+test("composeRecall labels a memory whose fact is below the score the index needs", () => {
+  const first = composeRecall(manyMemories(2, 0.001).resp, null, 0.01);
+  assert.equal(first.idIndex.count, 0);
+  assert.ok(first.injected.every(([, s]) => s.needsLabel));
 });

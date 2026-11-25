@@ -26,7 +26,7 @@ import { wrapRelevantMemoriesBlock } from "./filters.js";
 import { createFileLogger } from "./log.js";
 import { HeliconMediaClient } from "./media-client.js";
 import { registerMediaTools } from "./media-tools.js";
-import { performAutoRecall, type SeenBlocks } from "./recall.js";
+import { performAutoRecall, type SeenBlock, type SeenBlocks } from "./recall.js";
 import { HookBudget, RecallBudgets } from "./recall-budget.js";
 import { BRIDGE_PROTOCOL, formatBridgeContext, freezeBridgeBy, type BridgeTurn } from "./session-bridge.js";
 import { imageExtension, type ImageAttachment } from "./registry.js";
@@ -146,7 +146,7 @@ export class HeliconAdapter {
   /** `recallReference`: per session, the recall blocks its conversation holds (identity, hash of the text shown) ... */
   private readonly shown = new BoundedMap<SeenBlocks>(256);
   /** ... and the blocks of the turn in flight, which join them when the turn completes */
-  private readonly pendingShown = new BoundedMap<Array<[string, string]>>(256);
+  private readonly pendingShown = new BoundedMap<Array<[string, SeenBlock]>>(256);
   private unsubscribe: (() => void) | undefined;
   private idleTimer: ReturnType<typeof setInterval> | undefined;
   /** sessions this process created, resumed or took a turn in, and has not closed: what shutdown and idling look at */
@@ -418,7 +418,7 @@ export class HeliconAdapter {
       : Promise.resolve<BridgeTurn>({ state: "omitted", why: "not the first turn" });
     const frozen = freezeBridgeBy(bridgeTurn, budget.composeByMs());
 
-    const seen: SeenBlocks | undefined = cfg.recallReference ? (this.shown.get(sessionId) ?? new Map<string, string>()) : undefined;
+    const seen: SeenBlocks | undefined = cfg.recallReference ? (this.shown.get(sessionId) ?? new Map<string, SeenBlock>()) : undefined;
     const recall = cfg.autoRecall
       ? await performAutoRecall({
           client: this.client,
@@ -432,7 +432,7 @@ export class HeliconAdapter {
           bridgeShown: () => frozen.then((b) => (b.state === "omitted" ? null : b.rendering.shown)),
           ...(seen ? { seen } : {}),
         })
-      : { report: { outcome: "skipped" as const }, prependContext: undefined, shown: [] as Array<[string, string]> };
+      : { report: { outcome: "skipped" as const }, prependContext: undefined, shown: [] as Array<[string, SeenBlock]> };
     const bridge = await frozen;
     // in the conversation once this turn is in it (a turn that fails before is not counted)
     if (cfg.recallReference) this.pendingShown.set(sessionId, recall.shown ?? []);
@@ -539,7 +539,7 @@ export class HeliconAdapter {
     this.pendingShown.delete(sessionId);
     let seen = this.shown.get(sessionId);
     if (!seen || seen.size + blocks.length > SEEN_BLOCKS_MAX) seen = new Map();
-    for (const [key, hash] of blocks) seen.set(key, hash);
+    for (const [key, entry] of blocks) seen.set(key, entry);
     this.shown.set(sessionId, seen);
   }
 

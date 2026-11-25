@@ -123,8 +123,9 @@ const MEMORY_ID_INDEX_CLAIM_CHARS = 60;
  * Built client-side on purpose: the hs renderer is shared with the LoCoMo benchmark, and
  * changing it would change evaluation prompts.
  */
-function memoryIdIndex(rows: { memoryId: string | null; claim: string }[]): { text: string; count: number } {
-  const out: string[] = [];
+/** The rows the index lists: the first few distinct, valid ids. */
+function indexedIds(rows: { memoryId: string | null; claim: string }[]): { memoryId: string; claim: string }[] {
+  const taken: { memoryId: string; claim: string }[] = [];
   const seen = new Set<string>();
   for (const row of rows) {
     // 多条 fact 可能派生自同一条记忆——同一个 id 不重复占用索引名额。
@@ -133,11 +134,19 @@ function memoryIdIndex(rows: { memoryId: string | null; claim: string }[]): { te
       continue;
     }
     seen.add(memoryId);
-    const claim = row.claim.replace(/\s+/g, " ").trim().slice(0, MEMORY_ID_INDEX_CLAIM_CHARS);
-    out.push(`- ${memoryId} — ${claim}`);
-    if (out.length >= MEMORY_ID_INDEX_LIMIT) {
+    taken.push({ memoryId, claim: row.claim });
+    if (taken.length >= MEMORY_ID_INDEX_LIMIT) {
       break;
     }
+  }
+  return taken;
+}
+
+function memoryIdIndex(rows: { memoryId: string | null; claim: string }[]): { text: string; count: number } {
+  const out: string[] = [];
+  for (const { memoryId, claim: raw } of indexedIds(rows)) {
+    const claim = raw.replace(/\s+/g, " ").trim().slice(0, MEMORY_ID_INDEX_CLAIM_CHARS);
+    out.push(`- ${memoryId} — ${claim}`);
   }
   if (out.length === 0) {
     return { text: "", count: 0 };
@@ -264,13 +273,20 @@ export type ComposedRecall = {
    * the blocks shown in full this time that have an identity (`memory:<id>`, `topic:<name>`, `legend`), with the hash of
    * their text: what the session's conversation holds of the recall once this turn is in it
    */
-  injected: Array<[string, string]>;
+  injected: Array<[string, SeenBlock]>;
   /** blocks left out because the session's conversation already holds exactly their text */
   repeated: number;
 };
 
 /** What a session's conversation already holds of the recall, block by block: the block's identity, the hash of the text shown (`recallReference`). */
-export type SeenBlocks = Map<string, string>;
+export type SeenBlocks = Map<string, SeenBlock>;
+
+/**
+ * One recall block the conversation holds: the hash of its text, and whether a pointer to it has to carry the start of its text
+ * because the memory's id was not listed (MEMORY_IDS lists a few ids only): without it the model could not tell which item an id
+ * it never saw stands for.
+ */
+export type SeenBlock = { hash: string; needsLabel: boolean };
 
 function textHash(text: string): string {
   return createHash("sha1").update(text).digest("hex");
@@ -281,19 +297,25 @@ function blockKey(ref: PromptBlockRef): string | null {
   return ref.type === "legend" ? "legend" : shownKey(ref);
 }
 
-/** What names an item in a pointer: the first 8 characters of a memory id (the full ids were listed when it was first shown), a topic's name, a summary's session. */
-function itemName(ref: PromptBlockRef): string {
+/** The start of a fact's line as its block shows it, what MEMORY_IDS shows of a claim: an item whose id was not listed is found by this. */
+function blockSnippet(text: string): string {
+  const line = text.trimStart().replace(/^•/, "").trimStart().split("\n")[0] ?? "";
+  return line.replace(/\s+/g, " ").trim().slice(0, MEMORY_ID_INDEX_CLAIM_CHARS).trim();
+}
+
+/** What names an item in a pointer: the first 8 characters of a memory id (the full ids were listed when it was first shown), with `label` the start of its text too; a topic's name; a summary's session. */
+function itemName(ref: PromptBlockRef, label?: string): string {
   if (ref.type === "topic") return `topic "${ref.topic_name}"`;
   if (ref.type === "session_summary") return `summary of ${ref.session_id}`;
-  return (ref.type === "memory" ? ref.memory_id ?? "" : "").slice(0, 8);
+  const id = (ref.type === "memory" ? ref.memory_id ?? "" : "").slice(0, 8);
+  return label === undefined ? id : `${id} "${label}"`;
 }
 
 /** A pointer to an item whose text the session's conversation already holds, exactly. */
-function seenPointer(ref: PromptBlockRef): string {
-  const name = itemName(ref);
+function seenPointer(ref: PromptBlockRef, label?: string): string {
   return ref.type === "topic" || ref.type === "session_summary"
-    ? `\n• (${name}: shown earlier in this conversation)`
-    : `\n• (memory ${name}: shown earlier in this conversation)`;
+    ? `\n• (${itemName(ref)}: shown earlier in this conversation)`
+    : `\n• (memory ${itemName(ref, label)}: shown earlier in this conversation)`;
 }
 
 /**
@@ -338,7 +360,8 @@ export function composeRecall(
   const visible: { memoryId: string | null; claim: string }[] = [];
   const raws: { label: string; session: string; turns: string | null }[] = [];
   let removed = 0, keptMore = 0, otherVersion = 0;
-  const injected: Array<[string, string]> = [];
+  // (identity, hash of the text, the memory id of a memory block): the id decides, once the index is known, who needs a label
+  const injectedRaw: Array<[string, string, string | null]> = [];
   const repeatedNames: string[] = [];
   let newContent = 0;
   for (const b of pb.blocks) {
@@ -362,15 +385,19 @@ export function composeRecall(
     }
     const ownKey = blockKey(b.ref);
     const ownHash = textHash(b.text);
-    if (seen && ownKey !== null && seen.get(ownKey) === ownHash) {
+    const entry = seen && ownKey !== null ? seen.get(ownKey) : undefined;
+    if (entry !== undefined && entry.hash === ownHash) {
       // the same text is in the conversation already: the legend is not said again, an item is pointed to
       if (b.ref.type !== "legend") {
-        out.push(seenPointer(b.ref));
-        repeatedNames.push(itemName(b.ref));
+        const label = entry.needsLabel ? blockSnippet(b.text) : undefined;
+        out.push(seenPointer(b.ref, label));
+        repeatedNames.push(itemName(b.ref, label));
       }
       continue;
     }
-    if (ownKey !== null) injected.push([ownKey, ownHash]);
+    if (ownKey !== null) {
+      injectedRaw.push([ownKey, ownHash, b.ref.type === "memory" && b.ref.memory_id ? b.ref.memory_id.trim().toLowerCase() : null]);
+    }
     if (b.ref.type !== "legend" && b.ref.type !== "header") newContent++;
     out.push(b.text);
     if (b.ref.type === "memory" && b.ref.memory_id) {
@@ -383,6 +410,12 @@ export function composeRecall(
                   turns: b.ref.turns === null || b.ref.turns === undefined ? null : String(b.ref.turns) });
     }
   }
+  // a memory the index does not list is pointed to with the start of its text, from now on
+  const indexed = new Set(indexedIds(visible).map((row) => row.memoryId));
+  const injected: Array<[string, SeenBlock]> = injectedRaw.map(([key, hash, memoryId]) => [
+    key,
+    { hash, needsLabel: memoryId !== null && !indexed.has(memoryId) },
+  ]);
   const repeated = repeatedNames.length;
   if (repeated > 0 && newContent === 0) {
     // nothing of this recall is new to the session
@@ -422,7 +455,7 @@ export type AutoRecallResult = {
   prependContext?: string;
   report: AutoRecallReport;
   /** the recall blocks put into this turn in full, by identity and text hash (`recallReference`) */
-  shown?: Array<[string, string]>;
+  shown?: Array<[string, SeenBlock]>;
 };
 
 /**
