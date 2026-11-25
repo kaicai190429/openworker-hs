@@ -60,7 +60,7 @@ use filters::wrap_relevant_memories_block;
 use futures_util::future::{BoxFuture as SharedBox, FutureExt, Shared};
 use guidance::{agent_guidance, MODEL_TOOL_PREFIX, TOOL_NAMESPACE};
 use log::Logger;
-use recall::{perform_auto_recall, RecallParams, SeenBlocks};
+use recall::{perform_auto_recall, RecallParams, SeenBlock, SeenBlocks};
 use serde_json::json;
 use session_store::SessionStore;
 use std::{
@@ -159,7 +159,7 @@ struct Inner {
     /// `recallReference`: per session, the recall blocks its conversation holds (identity, hash of the text shown) ...
     shown: Mutex<HashMap<String, SeenBlocks>>,
     /// ... and the blocks of the turn in flight, which join them when the turn completes.
-    pending_shown: Mutex<HashMap<String, Vec<(String, u64)>>>,
+    pending_shown: Mutex<HashMap<String, Vec<(String, SeenBlock)>>>,
     /// Sessions that went through the SDK's `Session`, and have not been closed.
     attached: Mutex<HashSet<String>>,
     /// Sessions this process created, resumed or took a turn in, and has not closed: what shutdown and

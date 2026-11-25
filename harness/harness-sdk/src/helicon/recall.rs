@@ -101,8 +101,9 @@ fn build_skills_block(skills: &[Value]) -> (String, usize) {
 /// A compact id index for the injected block: the addressable memory ids (32 hex) of the strongest
 /// facts, so `memory_get` is reachable without a prior `memory_recall`. Worded as a data label, not
 /// an instruction (it sits inside the untrusted envelope); the trusted system text says what to do.
-fn memory_id_index(rows: &[(String, String)]) -> (String, usize) {
-    let mut out: Vec<String> = Vec::new();
+/// The (id, claim) rows the index lists: the first few distinct, valid ids.
+fn indexed_ids(rows: &[(String, String)]) -> Vec<(String, String)> {
+    let mut taken: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
     for (id, claim) in rows {
         // several facts can derive from one memory: an id takes one slot
@@ -110,14 +111,22 @@ fn memory_id_index(rows: &[(String, String)]) -> (String, usize) {
         if !is_memory_id(&id) || !seen.insert(id.clone()) {
             continue;
         }
+        taken.push((id, claim.clone()));
+        if taken.len() >= MEMORY_ID_INDEX_LIMIT {
+            break;
+        }
+    }
+    taken
+}
+
+fn memory_id_index(rows: &[(String, String)]) -> (String, usize) {
+    let mut out: Vec<String> = Vec::new();
+    for (id, claim) in indexed_ids(rows) {
         let claim = claim.split_whitespace().collect::<Vec<_>>().join(" ");
         out.push(format!(
             "- {id} — {}",
             prefix_utf16(&claim, MEMORY_ID_INDEX_CLAIM_CHARS).trim()
         ));
-        if out.len() >= MEMORY_ID_INDEX_LIMIT {
-            break;
-        }
     }
     if out.is_empty() {
         return (String::new(), 0);
@@ -267,14 +276,23 @@ pub(crate) struct ComposedRecall {
     pub other_version: usize,
     /// The blocks shown in full this time that have an identity (`memory:<id>`, `topic:<name>`, `legend`), with
     /// the hash of their text: what the session's history holds of the recall once this turn is in it.
-    pub injected: Vec<(String, u64)>,
+    pub injected: Vec<(String, SeenBlock)>,
     /// Blocks left out because the session's history already holds exactly their text.
     pub repeated: usize,
 }
 
 /// What a session's history already holds of the recall, block by block: the block's identity, and the hash of the
 /// text that was shown for it. (`recallReference`.)
-pub(crate) type SeenBlocks = HashMap<String, u64>;
+pub(crate) type SeenBlocks = HashMap<String, SeenBlock>;
+
+/// One recall block the conversation holds: the hash of its text, and whether a pointer to it has to carry the start of its
+/// text because the memory's id was not listed (MEMORY_IDS lists a few ids only): without it the model could not tell which
+/// item an id it never saw stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeenBlock {
+    pub hash: u64,
+    pub needs_label: bool,
+}
 
 pub(crate) fn text_hash(text: &str) -> u64 {
     let mut h = DefaultHasher::new();
@@ -295,25 +313,45 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// What names an item in a pointer: the first 8 characters of a memory id (the full ids were listed
-/// when the item was first shown), a topic's name, a session summary's session.
-fn item_name(r: &Value) -> String {
+/// The start of a fact's line as its block shows it, what MEMORY_IDS shows of a claim: an item whose id was not
+/// listed is found by this.
+fn block_snippet(text: &str) -> String {
+    let line = text
+        .trim_start()
+        .trim_start_matches('•')
+        .trim_start()
+        .lines()
+        .next()
+        .unwrap_or("");
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    prefix_utf16(&line, MEMORY_ID_INDEX_CLAIM_CHARS)
+        .trim()
+        .to_owned()
+}
+
+/// What names an item in a pointer: the first 8 characters of a memory id (the full ids were listed when the item was
+/// first shown), and with `label` the start of its text; a topic's name; a session summary's session.
+fn item_name(r: &Value, label: Option<&str>) -> String {
     match r["type"].as_str() {
         Some("topic") => format!("topic \"{}\"", str_of(r, "topic_name")),
         Some("session_summary") => format!("summary of {}", str_of(r, "session_id")),
-        _ => short_id(str_of(r, "memory_id")),
+        _ => match label {
+            Some(label) => format!("{} \"{label}\"", short_id(str_of(r, "memory_id"))),
+            None => short_id(str_of(r, "memory_id")),
+        },
     }
 }
 
 /// A pointer to an item whose text the session's history already holds, exactly.
-fn seen_pointer(r: &Value) -> String {
+fn seen_pointer(r: &Value, label: Option<&str>) -> String {
     match r["type"].as_str() {
-        Some("topic") | Some("session_summary") => {
-            format!("\n• ({}: shown earlier in this conversation)", item_name(r))
-        }
+        Some("topic") | Some("session_summary") => format!(
+            "\n• ({}: shown earlier in this conversation)",
+            item_name(r, None)
+        ),
         _ => format!(
             "\n• (memory {}: shown earlier in this conversation)",
-            item_name(r)
+            item_name(r, label)
         ),
     }
 }
@@ -377,7 +415,8 @@ pub(crate) fn compose_recall_with(
     let mut visible: Vec<(String, String)> = Vec::new();
     let mut raws: Vec<(String, String, Option<String>)> = Vec::new();
     let (mut removed, mut kept_more, mut other_version) = (0, 0, 0);
-    let mut injected: Vec<(String, u64)> = Vec::new();
+    // (identity, hash of the text, the memory id of a memory block): the id decides, once the index is known, who needs a label
+    let mut injected_raw: Vec<(String, u64, Option<String>)> = Vec::new();
     let mut repeated_names: Vec<String> = Vec::new();
     let mut new_content = 0usize;
     for b in blocks {
@@ -409,17 +448,21 @@ pub(crate) fn compose_recall_with(
         let own_key = block_key(r);
         let own_hash = text_hash(str_of(b, "text"));
         if let (Some(seen), Some(key)) = (seen, own_key.as_ref()) {
-            if seen.get(key) == Some(&own_hash) {
+            if let Some(entry) = seen.get(key).filter(|e| e.hash == own_hash) {
                 // the same text is in the conversation already: the legend is not said again, an item is pointed to
                 if r["type"] != "legend" {
-                    out.push_str(&seen_pointer(r));
-                    repeated_names.push(item_name(r));
+                    let label = entry.needs_label.then(|| block_snippet(str_of(b, "text")));
+                    out.push_str(&seen_pointer(r, label.as_deref()));
+                    repeated_names.push(item_name(r, label.as_deref()));
                 }
                 continue;
             }
         }
         if let Some(key) = own_key {
-            injected.push((key, own_hash));
+            let memory_id = (r["type"] == "memory")
+                .then(|| r["memory_id"].as_str().map(|s| s.trim().to_lowercase()))
+                .flatten();
+            injected_raw.push((key, own_hash, memory_id));
         }
         if !matches!(r["type"].as_str(), Some("legend") | Some("header")) {
             new_content += 1;
@@ -445,6 +488,18 @@ pub(crate) fn compose_recall_with(
             _ => {}
         }
     }
+    // a memory the index does not list is pointed to with the start of its text, from now on
+    let indexed: HashSet<String> = indexed_ids(&visible)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let injected: Vec<(String, SeenBlock)> = injected_raw
+        .into_iter()
+        .map(|(key, hash, memory_id)| {
+            let needs_label = memory_id.is_some_and(|id| !indexed.contains(&id));
+            (key, SeenBlock { hash, needs_label })
+        })
+        .collect();
     let repeated = repeated_names.len();
     if repeated > 0 && new_content == 0 {
         // nothing of this recall is new to the session
@@ -524,7 +579,7 @@ pub(crate) struct AutoRecallResult {
     pub report: AutoRecallReport,
     /// The recall blocks put into this turn in full, by identity and text hash (`recallReference`): the session's
     /// history holds them once the turn is in it.
-    pub shown: Vec<(String, u64)>,
+    pub shown: Vec<(String, SeenBlock)>,
 }
 
 fn skipped(outcome: &'static str) -> AutoRecallResult {
@@ -831,7 +886,13 @@ mod tests {
             memory_block("\n• likes coffee\n", ID_B),
         ];
         list.extend(more);
-        blocks(list)
+        // (the two memories have facts, so the index lists their ids)
+        let mut resp = blocks(list);
+        resp["grounded_facts"] = json!([
+            {"id": "pkg:a", "claim": "likes tea", "score": 0.9, "source_memory_ids": [ID_A]},
+            {"id": "pkg:b", "claim": "likes coffee", "score": 0.9, "source_memory_ids": [ID_B]},
+        ]);
+        resp
     }
 
     #[test]
@@ -923,6 +984,100 @@ mod tests {
             "{}",
             c.text
         );
+    }
+
+    /// A recall of `n` memories, each with a fact so that its id can be listed in MEMORY_IDS (the ids differ in their first 8 characters).
+    fn many_memories(n: usize, score: f64) -> Value {
+        let id = |i: usize| format!("{:08x}{}", i + 1, "0".repeat(24));
+        let claim = |i: usize| {
+            format!(
+                "CFO, Kestrel Labs · item{i}.key: {}",
+                "long text ".repeat(12)
+            )
+        };
+        let list: Vec<Value> = (0..n)
+            .map(|i| memory_block(&format!("\n• {}\n", claim(i)), &id(i)))
+            .collect();
+        let mut resp = blocks(list);
+        resp["grounded_facts"] = json!((0..n)
+            .map(|i| json!({"id": format!("pkg:{i}"), "claim": claim(i), "score": score, "source_memory_ids": [id(i)]}))
+            .collect::<Vec<_>>());
+        resp
+    }
+
+    #[test]
+    fn a_memory_the_index_did_not_list_is_pointed_to_with_the_start_of_its_text() {
+        let resp = many_memories(7, 0.9);
+        let first = compose_recall_with(&resp, None, 0.01, None).unwrap();
+        // the index lists 5 ids: the 6th and the 7th memory have no id in the text the conversation holds
+        assert_eq!(first.id_index.1, MEMORY_ID_INDEX_LIMIT);
+        let needs: Vec<bool> = first.injected.iter().map(|(_, s)| s.needs_label).collect();
+        assert_eq!(needs, vec![false, false, false, false, false, true, true]);
+        let seen: SeenBlocks = first.injected.iter().cloned().collect();
+
+        // all of it again: one line; the listed memories by their ids, the others with the start of their text too
+        let again = compose_recall_with(&resp, None, 0.01, Some(&seen)).unwrap();
+        assert_eq!(again.repeated, 7);
+        let snippet = block_snippet(&format!(
+            "\n• CFO, Kestrel Labs · item5.key: {}\n",
+            "long text ".repeat(12)
+        ));
+        assert!(
+            snippet.chars().count() <= 60 && snippet.starts_with("CFO, Kestrel Labs · item5.key:"),
+            "{snippet}"
+        );
+        assert!(
+            again.text.contains(&format!("00000006 \"{snippet}\"")),
+            "{}",
+            again.text
+        );
+        assert!(
+            again.text.contains("00000001,") && !again.text.contains("00000001 \""),
+            "{}",
+            again.text
+        );
+
+        // with something new beside them: a pointer per memory, and the label where it is needed
+        let mut next = many_memories(8, 0.9);
+        next["grounded_facts"].as_array_mut().unwrap().truncate(8);
+        let c = compose_recall_with(&next, None, 0.01, Some(&seen)).unwrap();
+        assert_eq!(c.repeated, 7);
+        assert!(
+            c.text.contains(&format!(
+                "• (memory 00000007 \"{}\": shown earlier in this conversation)",
+                block_snippet(&format!(
+                    "\n• CFO, Kestrel Labs · item6.key: {}\n",
+                    "long text ".repeat(12)
+                ))
+            )),
+            "{}",
+            c.text
+        );
+        assert!(
+            c.text
+                .contains("• (memory 00000001: shown earlier in this conversation)"),
+            "{}",
+            c.text
+        );
+    }
+
+    #[test]
+    fn a_memory_below_the_score_the_index_needs_is_labelled_too() {
+        // a fact under min_score is not listed in MEMORY_IDS, so its id was never in the text
+        let resp = many_memories(2, 0.001);
+        let first = compose_recall_with(&resp, None, 0.01, None).unwrap();
+        assert_eq!(first.id_index.1, 0);
+        assert!(first.injected.iter().all(|(_, s)| s.needs_label));
+    }
+
+    #[test]
+    fn the_snippet_is_the_first_line_of_the_fact_without_its_bullet_and_cut_at_the_index_width() {
+        assert_eq!(
+            block_snippet("\n•  a   b\n    ⤷ \"quote\" — operator\n"),
+            "a b"
+        );
+        let long = format!("\n• {}\n", "word ".repeat(40));
+        assert!(block_snippet(&long).chars().count() <= MEMORY_ID_INDEX_CLAIM_CHARS);
     }
 
     #[test]
